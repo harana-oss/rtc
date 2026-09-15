@@ -336,27 +336,32 @@ mod tests {
         }
     }
 
+    /// Builds a config offering `suites`, with whichever credentials they need — pass both
+    /// families to get a server holding a psk callback and certificates both.
     fn config(
         provider: Arc<dyn RTCCryptoProvider>,
         is_client: bool,
-        suite: CipherSuiteId,
+        suites: &[CipherSuiteId],
     ) -> Result<Arc<HandshakeConfig>> {
         let mut builder = ConfigBuilder::default()
             .with_crypto_provider(provider.clone())
-            .with_cipher_suites(vec![suite])
+            .with_cipher_suites(suites.to_vec())
             .with_insecure_skip_verify(true);
-        let is_psk = matches!(
-            suite,
-            CipherSuiteId::Tls_Psk_With_Aes_128_Ccm
-                | CipherSuiteId::Tls_Psk_With_Aes_128_Ccm_8
-                | CipherSuiteId::Tls_Psk_With_Aes_128_Gcm_Sha256
-        );
-        if is_psk {
+        let is_psk = |suite: &CipherSuiteId| {
+            matches!(
+                suite,
+                CipherSuiteId::Tls_Psk_With_Aes_128_Ccm
+                    | CipherSuiteId::Tls_Psk_With_Aes_128_Ccm_8
+                    | CipherSuiteId::Tls_Psk_With_Aes_128_Gcm_Sha256
+            )
+        };
+        if suites.iter().any(is_psk) {
             builder = builder.with_psk(Some(Arc::new(|_| Ok(vec![0xab, 0xcd, 0xef]))));
             if is_client {
                 builder = builder.with_psk_identity_hint(Some(b"rtc-dtls-test".to_vec()));
             }
-        } else if !is_client {
+        }
+        if !is_client && suites.iter().any(|suite| !is_psk(suite)) {
             builder = builder.with_certificates(vec![Certificate::generate_self_signed(
                 vec!["localhost".to_owned()],
                 provider.crypto(),
@@ -385,21 +390,33 @@ mod tests {
     fn handshake_and_exchange(
         client_provider: Arc<dyn RTCCryptoProvider>,
         server_provider: Arc<dyn RTCCryptoProvider>,
-        suite: CipherSuiteId,
+        client_suite: CipherSuiteId,
+        server_suites: &[CipherSuiteId],
     ) -> Result<()> {
-        let client_config = config(client_provider, true, suite)?;
-        let server_config = config(server_provider, false, suite)?;
-        let mut client = Endpoint::new(client_addr(), TransportProtocol::UDP, None);
+        let server_config = config(server_provider, false, server_suites)?;
         let mut server = Endpoint::new(server_addr(), TransportProtocol::UDP, Some(server_config));
+        exchange_with_server(&mut server, client_provider, client_addr(), client_suite)
+    }
+
+    /// Drives one client through a handshake and a record exchange against an existing server,
+    /// so several clients can be served by the one endpoint and configuration.
+    fn exchange_with_server(
+        server: &mut Endpoint,
+        client_provider: Arc<dyn RTCCryptoProvider>,
+        client_addr: SocketAddr,
+        client_suite: CipherSuiteId,
+    ) -> Result<()> {
+        let client_config = config(client_provider, true, &[client_suite])?;
+        let mut client = Endpoint::new(client_addr, TransportProtocol::UDP, None);
         client.connect(Instant::now(), server_addr(), client_config, None)?;
 
         let mut client_complete = false;
         let mut server_complete = false;
         for _ in 0..32 {
-            for event in transfer(&mut client, &mut server, client_addr())? {
+            for event in transfer(&mut client, server, client_addr)? {
                 server_complete |= matches!(event, EndpointEvent::HandshakeComplete);
             }
-            for event in transfer(&mut server, &mut client, server_addr())? {
+            for event in transfer(server, &mut client, server_addr())? {
                 client_complete |= matches!(event, EndpointEvent::HandshakeComplete);
             }
             if client_complete && server_complete {
@@ -408,7 +425,7 @@ mod tests {
         }
         assert!(
             client_complete && server_complete,
-            "DTLS handshake did not complete"
+            "DTLS handshake did not complete for a {client_suite:?} client"
         );
 
         client.write(Instant::now(), server_addr(), b"provider-backed DTLS")?;
@@ -418,7 +435,7 @@ mod tests {
         let replay = transmit.message.clone();
         let events = server.read(
             Instant::now(),
-            client_addr(),
+            client_addr,
             transmit.transport.ecn,
             transmit.message,
         )?;
@@ -428,7 +445,7 @@ mod tests {
         )));
         assert!(
             server
-                .read(Instant::now(), client_addr(), None, replay)?
+                .read(Instant::now(), client_addr, None, replay)?
                 .is_empty()
         );
         Ok(())
@@ -442,6 +459,7 @@ mod tests {
             provider.clone(),
             provider,
             CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+            &[CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256],
         )
     }
 
@@ -454,6 +472,7 @@ mod tests {
             provider.clone(),
             provider,
             CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+            &[CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256],
         )
     }
 
@@ -472,8 +491,8 @@ mod tests {
             CipherSuiteId::Tls_Psk_With_Aes_128_Ccm,
             CipherSuiteId::Tls_Psk_With_Aes_128_Ccm_8,
         ] {
-            handshake_and_exchange(ring.clone(), aws.clone(), suite)?;
-            handshake_and_exchange(aws.clone(), ring.clone(), suite)?;
+            handshake_and_exchange(ring.clone(), aws.clone(), suite, &[suite])?;
+            handshake_and_exchange(aws.clone(), ring.clone(), suite, &[suite])?;
         }
         Ok(())
     }
@@ -486,12 +505,32 @@ mod tests {
         let config = config(
             provider,
             true,
-            CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+            &[CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256],
         )?;
         let mut endpoint = Endpoint::new(client_addr(), TransportProtocol::UDP, None);
 
         let result = endpoint.connect(Instant::now(), server_addr(), config, None);
         assert!(matches!(result, Err(Error::Crypto(_))));
+        Ok(())
+    }
+
+    #[cfg(feature = "crypto-ring")]
+    #[test]
+    fn one_server_config_serves_psk_and_certificate_clients() -> Result<()> {
+        let provider: Arc<dyn RTCCryptoProvider> = Arc::new(crypto::providers::RingProvider::new());
+        let certificate_and_psk_suites = [
+            CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+            CipherSuiteId::Tls_Psk_With_Aes_128_Ccm_8,
+        ];
+
+        let server_config = config(provider.clone(), false, &certificate_and_psk_suites)?;
+        let mut server = Endpoint::new(server_addr(), TransportProtocol::UDP, Some(server_config));
+
+        for (index, client_suite) in certificate_and_psk_suites.into_iter().enumerate() {
+            let client_addr = SocketAddr::from(([127, 0, 0, 1], 4446 + index as u16));
+            exchange_with_server(&mut server, provider.clone(), client_addr, client_suite)?;
+        }
+
         Ok(())
     }
 }

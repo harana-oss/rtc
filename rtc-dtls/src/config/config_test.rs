@@ -133,3 +133,43 @@ fn test_config_build_permits_retransmissions() -> Result<()> {
 
     Ok(())
 }
+
+/// A client still presents one credential, so psk and certificates remain exclusive for it.
+///
+/// Only the server side was relaxed to hold both. The identity hint is set so the build gets past
+/// the earlier `ErrPskAndIdentityMustBeSetForClient` check and reaches this one.
+#[test]
+fn test_client_rejects_psk_and_certificate_but_server_accepts_both() -> Result<()> {
+    let provider = crypto::default_provider().map_err(crypto_error)?;
+    let with_both = || {
+        ConfigBuilder::default()
+            .with_crypto_provider(provider.clone())
+            .with_cipher_suites(vec![
+                CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+                CipherSuiteId::Tls_Psk_With_Aes_128_Ccm_8,
+            ])
+            .with_psk(Some(Arc::new(|_| Ok(vec![0xab, 0xcd, 0xef]))))
+            .with_psk_identity_hint(Some(b"rtc-dtls-test".to_vec()))
+            .with_certificates(vec![
+                Certificate::generate_self_signed(vec!["localhost".to_owned()], provider.crypto())
+                    .expect("self-signed certificate"),
+            ])
+    };
+
+    assert!(matches!(
+        with_both().build(true, None),
+        Err(Error::ErrPskAndCertificate)
+    ));
+
+    let server = with_both().build(false, None)?;
+    assert_eq!(
+        server.local_cipher_suites,
+        vec![
+            CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+            CipherSuiteId::Tls_Psk_With_Aes_128_Ccm_8,
+        ],
+        "the same credentials a client is rejected for let a server offer both families"
+    );
+
+    Ok(())
+}

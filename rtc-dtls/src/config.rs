@@ -168,8 +168,8 @@ impl ConfigBuilder {
     }
 
     /// certificates contains certificate chain to present to the other side of the connection.
-    /// Server MUST set this if psk is non-nil
-    /// client SHOULD sets this so CertificateRequests can be handled if psk is non-nil
+    /// Server MUST set this if psk is nil, and MAY set it alongside a psk to serve both families
+    /// Client SHOULD set this so CertificateRequests can be handled, and MUST NOT set it with a psk
     pub fn with_certificates(mut self, certificates: Vec<Certificate>) -> Self {
         self.certificates = certificates;
         self
@@ -224,7 +224,8 @@ impl ConfigBuilder {
     }
 
     /// psk sets the pre-shared key used by this DTLS connection
-    /// If psk is non-nil only psk cipher_suites will be used
+    /// A client with a psk offers only psk cipher_suites; a server that also holds certificates
+    /// offers both families and lets the negotiated suite decide which credential it uses
     pub fn with_psk(mut self, psk: Option<PskCallback>) -> Self {
         self.psk = psk;
         self
@@ -367,6 +368,18 @@ pub enum ExtendedMasterSecretType {
 }
 
 impl ConfigBuilder {
+    fn offered_cipher_suites(&self, is_client: bool) -> Result<Vec<Box<dyn CipherSuite>>> {
+        // a client offers one family or the other, while a server can only offer them if
+        // it actually holds a certificate.
+        let exclude_certificate = if is_client {
+            self.psk.is_some()
+        } else {
+            self.certificates.is_empty()
+        };
+
+        parse_cipher_suites(&self.cipher_suites, self.psk.is_none(), exclude_certificate)
+    }
+
     fn validate(&self, is_client: bool) -> Result<()> {
         if is_client && self.psk.is_some() && self.psk_identity_hint.is_none() {
             return Err(Error::ErrPskAndIdentityMustBeSetForClient);
@@ -376,7 +389,8 @@ impl ConfigBuilder {
             return Err(Error::ErrServerMustHaveCertificate);
         }
 
-        if !self.certificates.is_empty() && self.psk.is_some() {
+        // A server may hold both and let each handshake pick
+        if is_client && !self.certificates.is_empty() && self.psk.is_some() {
             return Err(Error::ErrPskAndCertificate);
         }
 
@@ -384,7 +398,7 @@ impl ConfigBuilder {
             return Err(Error::ErrIdentityNoPsk);
         }
 
-        parse_cipher_suites(&self.cipher_suites, self.psk.is_none(), self.psk.is_some())?;
+        self.offered_cipher_suites(is_client)?;
 
         Ok(())
     }
@@ -405,12 +419,14 @@ impl ConfigBuilder {
         })?;
         self.validate(is_client)?;
 
-        let mut local_cipher_suites: Vec<CipherSuiteId> =
-            parse_cipher_suites(&self.cipher_suites, self.psk.is_none(), self.psk.is_some())?
-                .iter()
-                .map(|cs| cs.id())
-                .filter(|id| id.supported_by(crypto_provider.crypto()))
-                .collect();
+        // Each id is paired with the suite's own `is_psk`, so the checks below can tell the two
+        // families apart without a second definition of which suites are psk.
+        let mut local_cipher_suites: Vec<(CipherSuiteId, bool)> = self
+            .offered_cipher_suites(is_client)?
+            .iter()
+            .map(|cs| (cs.id(), cs.is_psk()))
+            .filter(|(id, _)| id.supported_by(crypto_provider.crypto()))
+            .collect();
         if local_cipher_suites.is_empty() {
             return Err(Error::ErrNoAvailableCipherSuites);
         }
@@ -426,7 +442,9 @@ impl ConfigBuilder {
                 })
             })
             .collect();
-        if self.psk.is_none() && local_signature_schemes.is_empty() {
+
+        let has_non_psk_suites = local_cipher_suites.iter().any(|(_, is_psk)| !is_psk);
+        if has_non_psk_suites && local_signature_schemes.is_empty() {
             return Err(Error::ErrNoAvailableSignatureSchemes);
         }
 
@@ -440,36 +458,42 @@ impl ConfigBuilder {
                 })
             })
             .collect();
-        if self.psk.is_none() && local_named_curves.is_empty() {
+        if has_non_psk_suites && local_named_curves.is_empty() {
             return Err(Error::ErrNoAvailableCipherSuites);
         }
 
-        if !is_client && self.psk.is_none() {
+        if !is_client && has_non_psk_suites {
             let signing_key = &self.certificates[0].private_key.signing_key;
-            local_cipher_suites.retain(|id| {
-                local_signature_schemes.iter().any(|algorithm| {
-                    let signature_family_matches = match id {
-                        CipherSuiteId::Tls_Ecdhe_Rsa_With_Aes_128_Gcm_Sha256
-                        | CipherSuiteId::Tls_Ecdhe_Rsa_With_Aes_256_Cbc_Sha
-                        | CipherSuiteId::Tls_Ecdhe_Rsa_With_ChaCha20_Poly1305_Sha256 => {
-                            algorithm.signature
-                                == crate::signature_hash_algorithm::SignatureAlgorithm::Rsa
-                        }
-                        _ => {
-                            algorithm.signature
-                                == crate::signature_hash_algorithm::SignatureAlgorithm::Ecdsa
-                        }
-                    };
-                    signature_family_matches
-                        && algorithm
-                            .crypto_scheme()
-                            .is_ok_and(|scheme| signing_key.supports(scheme))
-                })
+            local_cipher_suites.retain(|(id, is_psk)| {
+                *is_psk
+                    || local_signature_schemes.iter().any(|algorithm| {
+                        let signature_family_matches =
+                            match id {
+                                CipherSuiteId::Tls_Ecdhe_Rsa_With_Aes_128_Gcm_Sha256
+                                | CipherSuiteId::Tls_Ecdhe_Rsa_With_Aes_256_Cbc_Sha
+                                | CipherSuiteId::Tls_Ecdhe_Rsa_With_ChaCha20_Poly1305_Sha256 => {
+                                    algorithm.signature
+                                        == crate::signature_hash_algorithm::SignatureAlgorithm::Rsa
+                                }
+                                _ => algorithm.signature
+                                    == crate::signature_hash_algorithm::SignatureAlgorithm::Ecdsa,
+                            };
+                        signature_family_matches
+                            && algorithm
+                                .crypto_scheme()
+                                .is_ok_and(|scheme| signing_key.supports(scheme))
+                    })
             });
-            if local_cipher_suites.is_empty() {
+            // A mixed config keeps its psk suites either way, so being left with only those
+            // means the certificate can sign none of the suites offered alongside them.
+            let only_psk_suites_left = local_cipher_suites.iter().all(|(_, is_psk)| *is_psk);
+            if only_psk_suites_left {
                 return Err(Error::ErrNoAvailableCipherSuites);
             }
         }
+
+        let local_cipher_suites: Vec<CipherSuiteId> =
+            local_cipher_suites.into_iter().map(|(id, _)| id).collect();
 
         let retransmit_interval = if self.flight_interval != Duration::from_secs(0) {
             self.flight_interval
