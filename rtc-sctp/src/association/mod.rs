@@ -506,7 +506,7 @@ impl Association {
             } else if failure {
                 self.on_retransmission_failure(timer);
             } else {
-                self.on_retransmission_timeout(timer, n_rtos);
+                self.on_retransmission_timeout(timer, n_rtos, now);
                 self.timers.start(timer, now, self.rto_mgr.get_rto());
             }
         }
@@ -2258,6 +2258,7 @@ impl Association {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
+                raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 self.gather_outbound_shutdown_packets(raw_packets, now)
             }
             AssociationState::ShutdownAckSent => {
@@ -2375,7 +2376,33 @@ impl Association {
             loop {
                 let tsn = self.cumulative_tsn_ack_point + i + 1;
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if c.acked || c.abandoned() || c.nsent > 1 || c.miss_indicator < 3 {
+                    // Cheap disqualifiers first: none of them depends on partial
+                    // reliability, and skipping on them keeps the stream lookup below
+                    // off every chunk in the window. Acked chunks are excluded here
+                    // rather than after the refresh so that evaluating the policy can
+                    // never let C2 carry a delivered message's SSN in a ForwardTSN.
+                    if c.acked || c.nsent > 1 || c.miss_indicator < 3 {
+                        i += 1;
+                        continue;
+                    }
+                    // Only genuine retransmission candidates reach here. `abandoned` is
+                    // only ever computed by the call below, so refresh it before reading
+                    // it: a timed-reliability message that expired while waiting for this
+                    // retransmission still looks live otherwise.
+                    Association::check_partial_reliability_status(
+                        c,
+                        now,
+                        self.use_forward_tsn,
+                        self.side,
+                        &self.streams,
+                    );
+                    // Only a whole message may be skipped. `all_inflight`, and therefore
+                    // `abandoned`, is set on the ending fragment alone, so skipping on it
+                    // would strand the earlier fragments at the peer: the same bytes on the
+                    // wire and nothing delivered. RFC 3758 Sec 3.5 A3 wants the whole run
+                    // abandoned together, which needs per-message state this does not have;
+                    // until then a fragmented message keeps its previous behaviour.
+                    if c.abandoned() && c.beginning_fragment && c.ending_fragment {
                         i += 1;
                         continue;
                     }
@@ -2407,6 +2434,8 @@ impl Association {
                 }
 
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
+                    // Also refresh after the send: `nsent` has just changed, and a spent
+                    // retransmission budget should be visible to C2 on this pass.
                     Association::check_partial_reliability_status(
                         c,
                         now,
@@ -2552,6 +2581,24 @@ impl Association {
                     continue;
                 }
 
+                // As above: `mark_all_to_retrasmit` flagged this chunk while its
+                // `abandoned` flag was still stale, so re-evaluate the policy before
+                // putting it back on the wire. RFC 3758 timed reliability must not
+                // transmit a message once its lifetime has expired.
+                Association::check_partial_reliability_status(
+                    c,
+                    now,
+                    self.use_forward_tsn,
+                    self.side,
+                    &self.streams,
+                );
+                // Whole messages only; see the matching guard on the fast-retransmit path.
+                if c.abandoned() && c.beginning_fragment && c.ending_fragment {
+                    c.retransmit = false;
+                    i += 1;
+                    continue;
+                }
+
                 if i == 0 && self.rwnd < c.user_data.len() as u32 {
                     // Send it as a zero window probe
                     done = true;
@@ -2572,6 +2619,7 @@ impl Association {
             }
 
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
+                // As on the fast-retransmit path: `nsent` has just changed.
                 Association::check_partial_reliability_status(
                     c,
                     now,
@@ -2579,7 +2627,6 @@ impl Association {
                     self.side,
                     &self.streams,
                 );
-
                 trace!(
                     "[{}] retransmitting tsn={} ssn={} sent={}",
                     self.side, c.tsn, c.stream_sequence_number, c.nsent
@@ -2885,6 +2932,43 @@ impl Association {
         rsn
     }
 
+    /// Re-evaluate partial reliability across the in-flight window.
+    ///
+    /// `abandoned` is a cached derivation of the chunk's transmission count and age, so
+    /// it goes stale between the points that compute it. Callers that gate transmission
+    /// or ForwardTSN progress on it must refresh first. Run on T3 only, where the window
+    /// is already being walked and the timer fires at most once per RTO.
+    fn refresh_partial_reliability_status(&mut self, now: Instant) {
+        if !self.use_forward_tsn {
+            return;
+        }
+
+        let mut tsn = self.cumulative_tsn_ack_point.wrapping_add(1);
+        while let Some(c) = self.inflight_queue.get_mut(tsn) {
+            // Skip what the peer already has: evaluating the policy for an acked chunk
+            // would let C2 carry a delivered message's SSN in a ForwardTSN, which is the
+            // same reason the fast-retransmit path tests `acked` first.
+            //
+            // Fragmented messages are skipped too. `all_inflight`, and therefore
+            // `abandoned`, is set on the ending fragment alone, so marking it would make
+            // `mark_all_to_retrasmit` drop that one fragment and strand the rest at the
+            // peer -- the same bytes on the wire and nothing delivered. RFC 3758 Sec 3.5
+            // A3 wants the whole run abandoned together, which needs per-message state
+            // this does not have; until then a fragmented message keeps its previous
+            // behaviour of being retransmitted late rather than abandoned.
+            if !c.acked && c.beginning_fragment && c.ending_fragment {
+                Association::check_partial_reliability_status(
+                    c,
+                    now,
+                    self.use_forward_tsn,
+                    self.side,
+                    &self.streams,
+                );
+            }
+            tsn = tsn.wrapping_add(1);
+        }
+    }
+
     fn check_partial_reliability_status(
         c: &mut ChunkPayloadData,
         now: Instant,
@@ -3142,7 +3226,7 @@ impl Association {
         self.awake_write_loop();
     }
 
-    fn on_retransmission_timeout(&mut self, timer_id: Timer, n_rtos: usize) {
+    fn on_retransmission_timeout(&mut self, timer_id: Timer, n_rtos: usize, now: Instant) {
         match timer_id {
             Timer::T1Init => {
                 if let Err(err) = self.send_init() {
@@ -3209,6 +3293,12 @@ impl Association {
                 //  SHOULD try to advance the "Advanced.Peer.Ack.Point" by following
                 //  the procedures outlined in C2 - C5.
                 if self.use_forward_tsn {
+                    // C2 reads `abandoned`, which is only ever computed by
+                    // `check_partial_reliability_status`. Refresh the window first, or a
+                    // message whose lifetime expired since it was sent still looks live
+                    // here and its ForwardTSN waits for another, backed-off T3.
+                    self.refresh_partial_reliability_status(now);
+
                     // RFC 3758 Sec 3.5 C2
                     let mut i = self.advanced_peer_tsn_ack_point + 1;
                     while let Some((abandoned, unordered, si, ssn)) =

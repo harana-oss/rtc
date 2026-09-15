@@ -1590,6 +1590,328 @@ fn test_assoc_timed_reliability_abandons_a_whole_fragmented_message() -> Result<
     Ok(())
 }
 
+/// Under timed reliability the sender must stop transmitting a message once its
+/// lifetime has expired. It does not: `abandoned` is only ever recomputed inside
+/// `check_partial_reliability_status`, which never runs between the first
+/// transmission and the T3 timeout, so the expired chunk still looks live when
+/// `mark_all_to_retrasmit` inspects it.
+#[test]
+fn test_assoc_timed_reliability_does_not_retransmit_after_lifetime() -> Result<()> {
+    let si: u16 = 9;
+    let lifetime_ms: u32 = 100;
+    let msg = Bytes::from_static(b"expires long before T3 can fire");
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    pair.client_stream(client_ch, si)?.set_reliability_params(
+        true,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+    pair.server_stream(server_ch, si)?.set_reliability_params(
+        true,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+
+    // Ignore whatever the handshake delivered.
+    pair.server_conn_mut(server_ch).stats.reset();
+
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?
+        .write_sctp(now, &msg, PayloadProtocolIdentifier::Binary)?;
+
+    // Transmit once, then lose it on the wire: the peer never sees it, and never
+    // acknowledges it, so the retransmission timer is left to run.
+    pair.drive_client();
+    pair.server.inbound.clear();
+    assert_eq!(
+        0,
+        pair.server_conn_mut(server_ch).stats.get_num_datas(),
+        "the first transmission must have been lost for this test to mean anything"
+    );
+
+    // Well past the lifetime, still short of the one-second T3.
+    pair.time += Duration::from_millis(500);
+    pair.drive_client();
+
+    // Let T3 fire, then deliver whatever the sender produced.
+    pair.time += Duration::from_millis(1500);
+    pair.drive_client();
+    pair.drive_server();
+
+    let redelivered = pair.server_conn_mut(server_ch).stats.get_num_datas();
+    assert_eq!(
+        0, redelivered,
+        "a message whose maxPacketLifeTime is {lifetime_ms}ms expired at t+{lifetime_ms}ms and \
+         must not be transmitted again, but the peer received it {redelivered} more time(s) \
+         at t+2000ms"
+    );
+
+    Ok(())
+}
+
+/// The same defect on the fast-retransmit leg: three duplicate SACKs put the
+/// sender into fast recovery, and the expired chunk is retransmitted because its
+/// `abandoned` flag has not been recomputed since it was first sent.
+#[test]
+fn test_assoc_timed_reliability_does_not_fast_retransmit_after_lifetime() -> Result<()> {
+    let si: u16 = 10;
+    let lifetime_ms: u32 = 10;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    pair.client_stream(client_ch, si)?.set_reliability_params(
+        true,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+    pair.server_stream(server_ch, si)?.set_reliability_params(
+        true,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+
+    let body = |tag: u32| {
+        let mut v = vec![0u8; 200];
+        v[0..4].copy_from_slice(&tag.to_be_bytes());
+        Bytes::from(v)
+    };
+
+    // Message 0 goes out and is lost.
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.write_sctp(
+        now,
+        &body(0),
+        PayloadProtocolIdentifier::Binary,
+    )?;
+    pair.drive_client();
+    pair.server.inbound.clear();
+
+    // Its 10 ms lifetime is long gone.
+    pair.time += Duration::from_millis(50);
+
+    // Three more messages, each delivered and SACKed separately, so the peer
+    // reports the gap three times and the sender enters fast recovery.
+    for tag in 1..=3u32 {
+        let now = pair.time;
+        pair.client_stream(client_ch, si)?.write_sctp(
+            now,
+            &body(tag),
+            PayloadProtocolIdentifier::Binary,
+        )?;
+        pair.drive_client();
+        pair.drive_server();
+        pair.drive_client();
+        pair.time += Duration::from_millis(1);
+    }
+
+    pair.drive_server();
+
+    let mut buf = vec![0u8; 1000];
+    let mut got = vec![];
+    while let Some(chunks) = pair.server_stream(server_ch, si)?.read_sctp()? {
+        chunks.read(&mut buf)?;
+        got.push(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]));
+    }
+
+    assert_eq!(
+        vec![1, 2, 3],
+        got,
+        "message 0 expired at t+{lifetime_ms}ms and must not be fast-retransmitted, \
+         while the three fresh messages must still arrive"
+    );
+    assert_eq!(
+        0,
+        pair.client_conn_mut(client_ch).stats.get_num_fast_retrans(),
+        "no fast retransmission should have been issued for an expired message"
+    );
+
+    Ok(())
+}
+
+/// Refusing to retransmit is only half of the contract: the association must also
+/// make progress. On an ordered stream the peer cannot deliver anything behind the
+/// expired message until a ForwardTSN tells it to skip, so the sender has to notice
+/// the expiry on the same T3 that decided not to retransmit — not on the next,
+/// backed-off one.
+#[test]
+fn test_assoc_timed_reliability_forwards_past_expired_without_extra_backoff() -> Result<()> {
+    let si: u16 = 11;
+    let lifetime_ms: u32 = 100;
+    let stale = Bytes::from_static(b"AAAA");
+    let fresh = Bytes::from_static(b"BBBBBBBB");
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // Ordered, so the peer is head-of-line blocked behind the expired message.
+    pair.client_stream(client_ch, si)?.set_reliability_params(
+        false,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+    pair.server_stream(server_ch, si)?.set_reliability_params(
+        false,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+
+    let t0 = pair.time;
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.write_sctp(
+        now,
+        &stale,
+        PayloadProtocolIdentifier::Binary,
+    )?;
+    pair.drive_client();
+    pair.server.inbound.clear(); // lost on the wire, and never acknowledged
+
+    // Long past its lifetime, queue a message that is still worth delivering.
+    pair.time += Duration::from_millis(200);
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.write_sctp(
+        now,
+        &fresh,
+        PayloadProtocolIdentifier::Binary,
+    )?;
+
+    let mut buf = vec![0u8; 64];
+    let mut delivered = None;
+    for _ in 0..400 {
+        pair.time += Duration::from_millis(25);
+        pair.drive_client();
+        pair.drive_server();
+        if let Some(chunks) = pair.server_stream(server_ch, si)?.read_sctp()? {
+            let n = chunks.len();
+            chunks.read(&mut buf)?;
+            delivered = Some((n, pair.time.duration_since(t0)));
+            break;
+        }
+    }
+
+    let (len, at) = delivered.expect("the fresh message must eventually be delivered");
+    assert_eq!(
+        fresh.len(),
+        len,
+        "the expired message must not be delivered; only the fresh one may be"
+    );
+    assert_eq!(
+        1,
+        pair.client_conn_mut(client_ch).stats.get_num_t3timeouts(),
+        "the ForwardTSN that unblocks the stream must be sent by the T3 that skipped \
+         the expired message, not by the next one; the fresh message arrived at {at:?}"
+    );
+
+    Ok(())
+}
+
+/// Documents a limitation rather than a fix. `all_inflight`, and therefore
+/// `abandoned`, is set on the ending fragment alone, so a fragmented message cannot be
+/// abandoned as a unit the way RFC 3758 Sec 3.5 A3 requires. Acting on the ending
+/// fragment by itself would be worse than doing nothing: `mark_all_to_retrasmit` would
+/// drop that one fragment, the earlier ones would still be sent, and the peer could
+/// never reassemble -- the same bytes on the wire and nothing delivered.
+///
+/// So a fragmented message keeps the behaviour it had before this change: retransmitted
+/// after its lifetime and delivered late. This test pins that, so the hole stays visible
+/// and cannot quietly turn into orphaned fragments.
+#[test]
+fn test_assoc_timed_reliability_leaves_fragmented_messages_alone() -> Result<()> {
+    let si: u16 = 20;
+    let lifetime_ms: u32 = 100;
+    // Comfortably over max_payload_size_for_mtu(INITIAL_MTU), so this fragments.
+    let big = Bytes::from(vec![0x5Au8; 3000]);
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+    pair.client_stream(client_ch, si)?.set_reliability_params(
+        false,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+    pair.server_stream(server_ch, si)?.set_reliability_params(
+        false,
+        ReliabilityType::Timed,
+        lifetime_ms,
+    )?;
+
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?
+        .write_sctp(now, &big, PayloadProtocolIdentifier::Binary)?;
+    pair.drive_client();
+    pair.server.inbound.clear(); // every fragment is lost
+
+    // Well past the lifetime, and past T3.
+    pair.time += Duration::from_millis(1500);
+    pair.drive_client();
+    pair.drive_server();
+
+    let mut buf = vec![0u8; 8000];
+    let mut delivered = 0usize;
+    while let Some(chunks) = pair.server_stream(server_ch, si)?.read_sctp()? {
+        delivered += chunks.len();
+        chunks.read(&mut buf)?;
+    }
+
+    assert_eq!(
+        big.len(),
+        delivered,
+        "a fragmented message must still arrive whole; abandoning only its ending \
+         fragment would put the other fragments on the wire and deliver nothing"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_assoc_timed_reliability_does_not_stall_shutdown() -> Result<()> {
+    let si: u16 = 21;
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+    pair.client_stream(client_ch, si)?.set_reliability_params(
+        false,
+        ReliabilityType::Timed,
+        100,
+    )?;
+    pair.server_stream(server_ch, si)?.set_reliability_params(
+        false,
+        ReliabilityType::Timed,
+        100,
+    )?;
+
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.write_sctp(
+        now,
+        &Bytes::from_static(b"last message, lost on the wire"),
+        PayloadProtocolIdentifier::Binary,
+    )?;
+    pair.drive_client();
+    pair.server.inbound.clear(); // lost, and it expires while outstanding
+
+    pair.time += Duration::from_millis(300);
+    pair.client_conn_mut(client_ch).shutdown()?;
+
+    for _ in 0..120 {
+        pair.drive_client();
+        pair.drive_server();
+        pair.drive_client();
+        pair.time += Duration::from_millis(50);
+    }
+
+    let state = pair.client_conn_mut(client_ch).state();
+    assert_ne!(
+        AssociationState::ShutdownPending,
+        state,
+        "the shutdown sequence stalled: a message abandoned while winding down is neither \
+         retransmitted nor skipped with a ForwardTSN, so the in-flight queue never empties"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_assoc_unreliable_rexmit_timed_ordered() -> Result<()> {
     //let _guard = subscribe();
