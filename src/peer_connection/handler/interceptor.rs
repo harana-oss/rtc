@@ -629,7 +629,7 @@ impl<'a> InterceptorHandler<'a> {
         let new_entry = receiver
             .track_mut()
             .set_codec_ssrc_by_rid(codec.rtp_codec, ssrc, &rid);
- 	assert!(!new_entry);
+        assert!(!new_entry);
 
         // Create inbound stream accumulator before firing OnOpen event
         self.stats
