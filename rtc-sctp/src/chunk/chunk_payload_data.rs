@@ -61,6 +61,29 @@ impl From<u32> for PayloadProtocolIdentifier {
     }
 }
 
+/// Sender policy captured once per message and copied to every fragment.
+/// It remains valid after stream reset, SID reuse, or later policy changes.
+#[derive(Debug, Default, Copy, Clone)]
+pub(crate) enum MessageReliability {
+    #[default]
+    Reliable,
+    Rexmit {
+        max_retransmits: u32,
+    },
+    Timed {
+        deadline: Instant,
+    },
+}
+
+impl MessageReliability {
+    pub(crate) fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Timed { deadline } => Some(deadline),
+            _ => None,
+        }
+    }
+}
+
 /// ChunkPayloadData represents an SCTP Chunk of type DATA
 //
 // 0                   1                   2                   3
@@ -108,8 +131,8 @@ pub struct ChunkPayloadData {
     pub(crate) payload_type: PayloadProtocolIdentifier,
     pub(crate) user_data: Bytes,
 
-    /// Whether this data chunk was acknowledged (received by peer)
-    pub(crate) acked: bool,
+    /// Acknowledged by a peer SACK, independently of local payload release.
+    pub(crate) acknowledged: bool,
     pub(crate) miss_indicator: u32,
 
     /// Partial-reliability parameters used only by sender.
@@ -124,13 +147,15 @@ pub struct ChunkPayloadData {
     /// Set once, from the instant the caller passed to `Stream::write*`, and
     /// never reassigned. This is the baseline for `ReliabilityType::Timed`.
     pub(crate) created_at: Option<Instant>,
+    /// Reliability belongs to the queued message, independently of its stream.
+    pub(crate) reliability: MessageReliability,
+    /// Identifies the stream incarnation whose send buffer owns this DATA.
+    pub(crate) stream_generation: u64,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
-    /// valid only with the first fragment
+    /// This fragment belongs to an atomically abandoned message.
     pub(crate) abandoned: bool,
-    /// valid only with the first fragment
-    pub(crate) all_inflight: bool,
 
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
@@ -149,13 +174,14 @@ impl Default for ChunkPayloadData {
             stream_sequence_number: 0,
             payload_type: PayloadProtocolIdentifier::default(),
             user_data: Bytes::new(),
-            acked: false,
+            acknowledged: false,
             miss_indicator: 0,
             since: None,
             created_at: None,
+            reliability: MessageReliability::Reliable,
+            stream_generation: 0,
             nsent: 0,
             abandoned: false,
-            all_inflight: false,
             retransmit: false,
         }
     }
@@ -232,13 +258,14 @@ impl Chunk for ChunkPayloadData {
             payload_type,
             user_data,
 
-            acked: false,
+            acknowledged: false,
             miss_indicator: 0,
             since: None,
             created_at: None,
+            reliability: MessageReliability::Reliable,
+            stream_generation: 0,
             nsent: 0,
             abandoned: false,
-            all_inflight: false,
             retransmit: false,
         })
     }
@@ -272,16 +299,27 @@ impl Chunk for ChunkPayloadData {
 
 impl ChunkPayloadData {
     pub(crate) fn abandoned(&self) -> bool {
-        self.abandoned && self.all_inflight
+        self.abandoned
     }
 
-    pub(crate) fn set_abandoned(&mut self, abandoned: bool) {
-        self.abandoned = abandoned;
+    pub(crate) fn is_outstanding(&self) -> bool {
+        !self.acknowledged && !self.abandoned
     }
 
-    pub(crate) fn set_all_inflight(&mut self) {
-        if self.ending_fragment {
-            self.all_inflight = true;
-        }
+    pub(crate) fn is_fast_retransmit_candidate(&self) -> bool {
+        self.is_outstanding() && self.nsent == 1 && self.miss_indicator >= 3
+    }
+
+    /// Record peer progress without changing payload ownership.
+    pub(crate) fn acknowledge(&mut self) -> bool {
+        let newly_acknowledged = !self.acknowledged;
+        self.acknowledged = true;
+        self.retransmit = false;
+        newly_acknowledged
+    }
+
+    pub(crate) fn mark_abandoned(&mut self) {
+        self.abandoned = true;
+        self.retransmit = false;
     }
 }

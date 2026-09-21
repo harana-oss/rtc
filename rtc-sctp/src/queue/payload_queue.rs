@@ -19,6 +19,10 @@ pub(crate) struct PayloadQueue {
     pub(crate) sorted: VecDeque<u32>,
     dup_tsn: Vec<u32>,
     n_bytes: usize,
+    #[cfg(test)]
+    pub(crate) track_lookups: bool,
+    #[cfg(test)]
+    pub(crate) lookups: std::cell::Cell<usize>,
 }
 
 impl PayloadQueue {
@@ -82,9 +86,17 @@ impl PayloadQueue {
 
     /// get returns reference to chunkPayloadData with the given TSN value.
     pub(crate) fn get(&self, tsn: u32) -> Option<&ChunkPayloadData> {
+        #[cfg(test)]
+        if self.track_lookups {
+            self.lookups.set(self.lookups.get() + 1);
+        }
         self.chunk_map.get(&tsn)
     }
     pub(crate) fn get_mut(&mut self, tsn: u32) -> Option<&mut ChunkPayloadData> {
+        #[cfg(test)]
+        if self.track_lookups {
+            self.lookups.set(self.lookups.get() + 1);
+        }
         self.chunk_map.get_mut(&tsn)
     }
 
@@ -133,10 +145,15 @@ impl PayloadQueue {
         s
     }
 
-    pub(crate) fn mark_as_acked(&mut self, tsn: u32) -> usize {
+    pub(crate) fn acknowledge(&mut self, tsn: u32) -> bool {
+        self.chunk_map
+            .get_mut(&tsn)
+            .is_some_and(ChunkPayloadData::acknowledge)
+    }
+
+    /// Release each payload byte once, preserving its acknowledgment state.
+    pub(crate) fn release_payload(&mut self, tsn: u32) -> usize {
         if let Some(c) = self.chunk_map.get_mut(&tsn) {
-            c.acked = true;
-            c.retransmit = false;
             let n = c.user_data.len();
             self.n_bytes -= n;
             c.user_data.clear();
@@ -152,7 +169,7 @@ impl PayloadQueue {
 
     pub(crate) fn mark_all_to_retrasmit(&mut self) {
         for c in self.chunk_map.values_mut() {
-            if c.acked || c.abandoned() {
+            if !c.is_outstanding() {
                 continue;
             }
             c.retransmit = true;
