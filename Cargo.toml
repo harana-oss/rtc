@@ -15,6 +15,7 @@ members = [
     "rtc-srtp",
     "rtc-stun",
     "rtc-turn",
+    "benchmarks/rtc-bench",
 ]
 resolver = "2"
 
