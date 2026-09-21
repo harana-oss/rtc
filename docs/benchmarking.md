@@ -12,6 +12,7 @@ command.
 - [The suite](#the-suite)
 - [Running](#running)
 - [Comparing two revisions](#comparing-two-revisions)
+- [Comparing with upstream](#comparing-with-upstream)
 - [RUSTFLAGS silently changes the numbers](#rustflags-silently-changes-the-numbers)
 - [The end-to-end harness](#the-end-to-end-harness)
 - [Allocations per packet](#allocations-per-packet)
@@ -135,10 +136,14 @@ What it does, in order:
 4. **Runs BASE and HEAD alternately**, `--rounds` times, into one results directory
    (`target/bench-compare/<base>-vs-<head>/`), so slow drift — thermal throttling, a background
    indexer — lands on both sides instead of one.
-5. **Writes `report.md`** with the machine, toolchain, flags, notes and a table.
+5. **Writes `report.md`** with the machine, toolchain, flags, notes and a table. A benchmark process
+   that fails partway — killed from outside, say — is noted in the report and the rest of the run
+   carries on; its rows cover the rounds that completed.
 
 The selection (`-p`, `--bench`, `--filter`) is defined against HEAD. BASE runs whatever part of it
 exists there, and anything new appears under *Only in head* rather than failing the comparison.
+For a BASE that predates part of the suite, `--overlay-benches` runs HEAD's benchmarks there
+instead; see [Comparing with upstream](#comparing-with-upstream).
 
 ### Reading the report
 
@@ -167,11 +172,46 @@ than 2.8%. (The 7.28 µs is not a typo: that shell exported `RUSTFLAGS`. See the
   otherwise the mean.
 - A comparison is only as sound as the benchmark being the same on both sides. If the benchmark's
   source changed between BASE and HEAD, check the diff (`git diff BASE -- path/to/bench.rs`) before
-  trusting the row. Procedure A in the migration doc covers this.
+  trusting the row, or compare with `--overlay-benches`, which runs HEAD's benchmark sources on both
+  sides. Procedure A in the migration doc covers this.
 
 For quoting results in a crate's `benches/README.md`, follow the
 [reporting rules](benchmarking-crypto-migration.md#reporting). The report header already carries
 most of what they ask for.
+
+## Comparing with upstream
+
+```bash
+python3 scripts/bench.py upstream                              # this fork vs. webrtc-rs/rtc master
+python3 scripts/bench.py upstream --rounds 3 -p rtc-bench      # what to quote
+python3 scripts/bench.py upstream --branch v1.x --head master  # another branch, a committed fork revision
+python3 scripts/bench.py upstream --no-fetch --quick           # reuse the last fetch
+```
+
+This repository is a fork of [webrtc-rs/rtc](https://github.com/webrtc-rs/rtc). `upstream` measures
+what the fork's changes are worth against it: BASE is upstream's branch (`master` by default), HEAD
+is this fork — the working tree, or `--head REV`. It is `compare` with two additions:
+
+1. **It fetches the upstream branch** into a private ref, `refs/bench/upstream/<branch>`. No remote
+   or branch is added to the repository. `--url` points it at a different repository;
+   `--no-fetch` reuses the last fetch.
+2. **It runs this fork's benchmarks on upstream too** (the same as `compare --overlay-benches`).
+   Upstream has only the per-crate benchmarks it shipped with — none of `benchmarks/rtc-bench`,
+   and not the `rtc-sctp`, `rtc-shared` or `rtc-ice` benches — so a plain comparison would measure
+   only those. The overlay copies every HEAD bench source that is missing or different into
+   upstream's worktree, then adds what upstream's manifests lack for them: `[[bench]]` targets,
+   dev-dependencies, bench features, and `benchmarks/rtc-bench` as a workspace member. Both sides
+   then compile identical benchmark code, and the only difference measured is the library under
+   it.
+
+The report says exactly what the overlay copied and added. Everything else in upstream's tree is
+left as it is, and the overlaid worktree (`…/worktrees/rtc-<sha>-overlay`) is kept apart from a
+plain one and reset before each run, so a later plain `compare` never sees the overlay.
+
+A benchmark written against an API this fork added or changed may not compile against upstream.
+Such a target is left out at BASE, listed in the report as *measured at head only*, and the rest of
+the comparison goes ahead. Everything else from [Comparing two revisions](#comparing-two-revisions)
+applies unchanged: same machine, alternating rounds, `--rounds 3` for anything you will quote.
 
 ## RUSTFLAGS silently changes the numbers
 

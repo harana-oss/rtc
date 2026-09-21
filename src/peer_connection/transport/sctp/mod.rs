@@ -50,8 +50,6 @@ pub(crate) struct SctpTransport {
     // Optional override for the outbound SCTP DATA-packet budget, applied to the endpoint's
     // `EndpointConfig` in `start()`. None uses the sctp crate default (INITIAL_MTU, 1191).
     pub(crate) mtu: Option<u32>,
-
-    pub(crate) internal_buffer: Vec<u8>,
 }
 
 impl SctpTransport {
@@ -74,7 +72,6 @@ impl SctpTransport {
             negotiated_max_message_size: None,
             max_receive_buffer_size,
             mtu,
-            internal_buffer: vec![],
         }
     }
 
@@ -120,11 +117,18 @@ impl SctpTransport {
     ///
     /// Always finite. The spec types the attribute `unrestricted double` so that an
     /// implementation with no limit can report positive infinity; this one always has a limit,
-    /// because the value also sizes a real allocation — see `start()`.
+    /// because each inbound message is reassembled into a single allocation — see `start()`.
     ///
     /// [RFC 8841 §6]: https://datatracker.ietf.org/doc/html/rfc8841#section-6
     pub(crate) fn max_message_size(&self) -> Option<u32> {
         self.negotiated_max_message_size
+    }
+
+    /// The largest message the handler accepts in either direction, in bytes.
+    ///
+    /// `0` before `start()` has negotiated a size, so nothing passes until then.
+    pub(crate) fn max_message_len(&self) -> usize {
+        self.negotiated_max_message_size.unwrap_or(0) as usize
     }
 
     /// W3C `SctpTransport.maxChannels`: the minimum of the negotiated inbound and outbound
@@ -152,16 +156,16 @@ impl SctpTransport {
         self.is_started = true;
 
         // W3C §6.1.1.2 defines `canSendSize` as what this endpoint can actually send, and allows
-        // 0 only when the implementation "can handle messages of any size". This one cannot: the
-        // working buffer below is a real allocation, so the ceiling is `MAX_MESSAGE_SIZE`. A
-        // configured 0 therefore resolves to that ceiling rather than to "unlimited".
+        // 0 only when the implementation "can handle messages of any size". This one cannot: each
+        // inbound message is reassembled into one allocation of up to this size, so the ceiling
+        // is `MAX_MESSAGE_SIZE`. A configured 0 therefore resolves to that ceiling rather than to
+        // "unlimited".
         //
-        // Without this, `calc_message_size(0, 0)` yields `u32::MAX` and the two lines below try to
-        // allocate a 4 GiB buffer and configure an unbounded message size — an OOM waiting for the
-        // first peer that advertises no limit. Reporting `u32::MAX` while enforcing something far
-        // smaller would be worse than either: `maxMessageSize` is a promise to the application
-        // about what it may pass to `send()`, so the value reported and the value enforced have to
-        // be the same one.
+        // Without this, `calc_message_size(0, 0)` yields `u32::MAX` and the transport config below
+        // would accept messages of up to 4 GiB — an OOM waiting for the first peer that advertises
+        // no limit. Reporting `u32::MAX` while enforcing something far smaller would be worse than
+        // either: `maxMessageSize` is a promise to the application about what it may pass to
+        // `send()`, so the value reported and the value enforced have to be the same one.
         let can_send_size = match self.max_message_size.as_usize() as u32 {
             0 => SctpMaxMessageSize::MAX_MESSAGE_SIZE,
             configured => configured,
@@ -169,11 +173,11 @@ impl SctpTransport {
         let max_message_size =
             SctpTransport::calc_message_size(remote_caps.max_message_size, can_send_size);
 
-        // This is the spec's [[MaxMessageSize]] slot. It was previously computed here, used to size
-        // the buffer and the transport config, and then discarded, which left nothing for
-        // `maxMessageSize` to report.
+        // This is the spec's [[MaxMessageSize]] slot, and the number the handler enforces on
+        // both directions via `max_message_len`. It used to size a working buffer as well, which
+        // nothing read after reassembly started writing straight into the delivered payload:
+        // 64 KiB (up to 256 KiB) per started transport, allocated for nothing.
         self.negotiated_max_message_size = Some(max_message_size);
-        self.internal_buffer.resize(max_message_size as usize, 0u8);
 
         let mut sctp_endpoint_config = ::sctp::EndpointConfig::default();
         if let Some(mtu) = self.mtu {
@@ -258,11 +262,11 @@ mod tests {
         assert_eq!(Some(16384), transport.max_message_size());
     }
 
-    // Neither side names a limit. This implementation still has one — the working buffer is a
-    // real allocation — so `canSendSize` resolves to `MAX_MESSAGE_SIZE` rather than to
-    // "unlimited" (W3C §6.1.1.2 allows 0 only for an implementation that can handle any size).
-    // Reporting `u32::MAX` here would promise the application 4 GiB messages and then allocate a
-    // 256 KiB buffer.
+    // Neither side names a limit. This implementation still has one — each message is
+    // reassembled into a single allocation — so `canSendSize` resolves to `MAX_MESSAGE_SIZE`
+    // rather than to "unlimited" (W3C §6.1.1.2 allows 0 only for an implementation that can
+    // handle any size). Reporting `u32::MAX` here would promise the application 4 GiB messages
+    // and then enforce 256 KiB.
     #[test]
     fn no_limit_on_either_side_resolves_to_the_implementation_ceiling() {
         let transport = started_transport(SctpMaxMessageSize::Bounded(0), 0);
@@ -272,8 +276,36 @@ mod tests {
         );
         assert_eq!(
             SctpMaxMessageSize::MAX_MESSAGE_SIZE as usize,
-            transport.internal_buffer.len(),
-            "the reported size and the buffer actually allocated must be the same number"
+            transport.max_message_len(),
+            "the reported size and the size enforced must be the same number"
+        );
+    }
+
+    // `Unbounded` is the configured-unbounded case: it resolves to the same ceiling, reported
+    // and enforced alike.
+    #[test]
+    fn unbounded_configuration_enforces_the_implementation_ceiling() {
+        let transport = started_transport(SctpMaxMessageSize::Unbounded, 0);
+        assert_eq!(
+            Some(SctpMaxMessageSize::MAX_MESSAGE_SIZE),
+            transport.max_message_size()
+        );
+        assert_eq!(
+            SctpMaxMessageSize::MAX_MESSAGE_SIZE as usize,
+            transport.max_message_len()
+        );
+    }
+
+    // What is enforced follows the negotiated value, not the configured one, so a peer's
+    // smaller limit binds this endpoint's sends and receives alike.
+    #[test]
+    fn enforced_limit_is_the_negotiated_one() {
+        let transport = started_transport(SctpMaxMessageSize::default(), 16384);
+        assert_eq!(16384, transport.max_message_len());
+        let transport = started_transport(SctpMaxMessageSize::default(), 0);
+        assert_eq!(
+            SctpMaxMessageSize::DEFAULT_MESSAGE_SIZE as usize,
+            transport.max_message_len()
         );
     }
 
@@ -287,6 +319,11 @@ mod tests {
             test_transport_id(TransportKind::Dtls),
         );
         assert_eq!(None, transport.max_message_size());
+        assert_eq!(
+            0,
+            transport.max_message_len(),
+            "nothing passes before a size has been negotiated"
+        );
     }
 
     // No association yet: the spec's initial state, and nothing to report for maxChannels.

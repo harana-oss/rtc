@@ -1,6 +1,6 @@
 //! NACK Responder Interceptor - Responds to NACK requests by retransmitting packets.
 
-use super::send_buffer::SendBuffer;
+use super::send_buffer::{HistoryLimits, SendBuffer};
 use super::stream_supports_nack;
 use crate::Interceptor;
 use crate::stream_info::StreamInfo;
@@ -9,7 +9,10 @@ use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Default for how long a sent packet stays retransmittable: [`NackResponderBuilder::with_max_age`].
+const DEFAULT_MAX_AGE: Duration = Duration::from_secs(3);
 
 /// Builder for the NackResponderInterceptor.
 ///
@@ -21,17 +24,26 @@ use std::time::Instant;
 /// let chain = Registry::new()
 ///     .with(Slot::NackResponder, NackResponderBuilder::new()
 ///         .with_size(1024)
+///         .with_max_bytes(1 << 20)
 ///         .build())
 ///     .build();
 /// ```
 pub struct NackResponderBuilder {
     /// Size of the send buffer (must be power of 2: 1, 2, 4, ..., 32768).
     size: u16,
+    /// Retransmission history limits beyond the packet count.
+    limits: HistoryLimits,
 }
 
 impl Default for NackResponderBuilder {
     fn default() -> Self {
-        Self { size: 1024 }
+        Self {
+            size: 1024,
+            limits: HistoryLimits {
+                max_bytes: usize::MAX,
+                max_age: Some(DEFAULT_MAX_AGE),
+            },
+        }
     }
 }
 
@@ -50,9 +62,33 @@ impl NackResponderBuilder {
         self
     }
 
+    /// Bound each stream's history by the payload bytes it keeps alive, as well as by packet
+    /// count. Unbounded by default, so the packet count alone applies.
+    ///
+    /// RTP payloads are shared, so the history copies nothing — but it holds each payload's
+    /// allocation for as long as the packet is kept. When the limit is exceeded the oldest
+    /// packets are dropped first. The most recent packet is always kept.
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.limits.max_bytes = max_bytes;
+        self
+    }
+
+    /// How long a sent packet stays available for retransmission. Default: 3 seconds.
+    ///
+    /// A retransmission is only useful while the receiver is still waiting for the packet, a
+    /// few round trips at most; past that it arrives too late to be played. The limit also
+    /// releases a stream's history once it stops sending, rather than holding up to `size`
+    /// packets for as long as the stream stays bound. Size it to the longest recovery window
+    /// worth supporting — several times the round-trip time. `None` keeps packets until the
+    /// packet count or byte limit displaces them.
+    pub fn with_max_age(mut self, max_age: Option<Duration>) -> Self {
+        self.limits.max_age = max_age;
+        self
+    }
+
     /// Build the interceptor.
     pub fn build(self) -> NackResponderInterceptor {
-        NackResponderInterceptor::new(self.size)
+        NackResponderInterceptor::new(self.size, self.limits)
     }
 }
 
@@ -75,6 +111,7 @@ struct LocalStream {
 pub struct NackResponderInterceptor {
     /// Configuration
     size: u16,
+    limits: HistoryLimits,
 
     /// Send buffers per local stream SSRC
     streams: HashMap<u32, LocalStream>,
@@ -86,10 +123,11 @@ pub struct NackResponderInterceptor {
 }
 
 impl NackResponderInterceptor {
-    fn new(size: u16) -> Self {
+    fn new(size: u16, limits: HistoryLimits) -> Self {
         Self {
             read_queue: VecDeque::new(),
             size,
+            limits,
             streams: HashMap::new(),
             write_queue: VecDeque::new(),
         }
@@ -123,7 +161,7 @@ impl NackResponderInterceptor {
 
         // Queue retransmissions
         for seq in seqs_to_retransmit {
-            let Some(original_packet) = stream.send_buffer.get(seq) else {
+            let Some(original_packet) = stream.send_buffer.get(seq, now) else {
                 continue;
             };
 
@@ -211,7 +249,7 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
         if let Packet::Rtp(ref rtp_packet) = msg.message.packet
             && let Some(stream) = self.streams.get_mut(&rtp_packet.header.ssrc)
         {
-            stream.send_buffer.add(rtp_packet.clone());
+            stream.send_buffer.add(rtp_packet.clone(), msg.now);
         }
 
         self.write_queue.push_back(msg);
@@ -224,19 +262,33 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
         self.write_queue.pop_front()
     }
 
-    fn handle_timeout(&mut self, _now: Instant) -> Result<(), Self::Error> {
+    /// Releases the history of streams that have stopped sending. A stream still sending
+    /// evicts aged packets as it adds new ones; this is for the one that went quiet.
+    fn handle_timeout(&mut self, now: Instant) -> Result<(), Self::Error> {
+        for stream in self.streams.values_mut() {
+            if stream
+                .send_buffer
+                .expires_at()
+                .is_some_and(|expires_at| expires_at <= now)
+            {
+                stream.send_buffer.expire(now);
+            }
+        }
         Ok(())
     }
 
     fn poll_timeout(&mut self) -> Option<Self::Time> {
-        None
+        self.streams
+            .values()
+            .filter_map(|stream| stream.send_buffer.expires_at())
+            .min()
     }
 }
 
 impl Interceptor for NackResponderInterceptor {
     fn bind_local_stream(&mut self, info: &StreamInfo) {
         if stream_supports_nack(info)
-            && let Some(send_buffer) = SendBuffer::new(self.size)
+            && let Some(send_buffer) = SendBuffer::with_limits(self.size, self.limits)
         {
             self.streams.insert(
                 info.ssrc,

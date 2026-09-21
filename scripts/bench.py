@@ -13,13 +13,18 @@ Usage:
     python3 scripts/bench.py list
     python3 scripts/bench.py check [--providers all]
     python3 scripts/bench.py run [--quick] [--package P] [--bench P:T] [--filter REGEX]
-    python3 scripts/bench.py compare BASE [--head REV] [--rounds N] [--quick] [...]
+    python3 scripts/bench.py compare BASE [--head REV] [--rounds N] [--overlay-benches] [...]
+    python3 scripts/bench.py upstream [--branch B] [--rounds N] [--quick] [...]
     python3 scripts/bench.py report BASELINE [OTHER] [--criterion-home DIR]
 
 `run` saves a named criterion baseline — by default the short commit, with `-dirty` appended for
 uncommitted changes — and prints a table of it. `report A B` compares any two saved baselines.
 Prefer `compare` for before/after questions: it builds BASE in a separate worktree and alternates
 BASE and HEAD runs in one session, which is the only comparison this workspace trusts.
+
+`upstream` is `compare` against webrtc-rs/rtc: it fetches the upstream branch, overlays this
+tree's benchmark sources onto it so both sides run identical benchmark code, and compares it with
+this fork.
 
 See docs/benchmarking.md for the suite this drives and how to read what it prints.
 """
@@ -37,6 +42,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, TextIO
@@ -69,6 +75,12 @@ DEFAULT_WORKTREE_DIR = Path(
 
 META_DIR = "rtc-bench-meta"
 
+# What `upstream` compares this fork against. The fetched branch is kept under a private ref
+# rather than a remote, so fetching adds no remote or branch to the repository.
+UPSTREAM_URL = "https://github.com/webrtc-rs/rtc.git"
+UPSTREAM_BRANCH = "master"
+UPSTREAM_REF_PREFIX = "refs/bench/upstream/"
+
 
 # --------------------------------------------------------------------------------------------
 # Discovery
@@ -95,13 +107,8 @@ class Bench:
         return "criterion" if self.criterion else "report"
 
 
-def discover(root: Path) -> list:
-    """Every bench target of every workspace member under `root`.
-
-    A target is a criterion benchmark if its source invokes `criterion_main!`. Anything else —
-    `rtc-interceptor`'s congestion-control report, for instance — prints its own results, takes
-    no criterion arguments, and is only run when selected by name.
-    """
+def workspace_packages(root: Path) -> list:
+    """`cargo metadata` for every workspace member under `root`."""
     output = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         cwd=root,
@@ -111,11 +118,18 @@ def discover(root: Path) -> list:
     ).stdout
     metadata = json.loads(output)
     members = set(metadata["workspace_members"])
+    return [package for package in metadata["packages"] if package["id"] in members]
 
+
+def discover(root: Path) -> list:
+    """Every bench target of every workspace member under `root`.
+
+    A target is a criterion benchmark if its source invokes `criterion_main!`. Anything else —
+    `rtc-interceptor`'s congestion-control report, for instance — prints its own results, takes
+    no criterion arguments, and is only run when selected by name.
+    """
     benches = []
-    for package in metadata["packages"]:
-        if package["id"] not in members:
-            continue
+    for package in workspace_packages(root):
         for target in package["targets"]:
             if "bench" not in target["kind"]:
                 continue
@@ -277,8 +291,11 @@ def lock_versions(root: Path) -> dict:
 # --------------------------------------------------------------------------------------------
 
 
-def stream(command: list, cwd: Path, env: dict, log: Optional[TextIO]) -> None:
-    """Runs `command`, echoing its output live and into `log`. Exits on failure."""
+def stream(
+    command: list, cwd: Path, env: dict, log: Optional[TextIO], check: bool = True
+) -> int:
+    """Runs `command`, echoing its output live and into `log`, and returns its exit code. Exits
+    on failure unless `check` is false."""
     banner = f"$ (cd {cwd} && {shlex.join(command)})\n"
     sys.stdout.write(banner)
     sys.stdout.flush()
@@ -298,28 +315,48 @@ def stream(command: list, cwd: Path, env: dict, log: Optional[TextIO]) -> None:
             sys.stdout.write(line)
             if log:
                 log.write(line)
-    if process.returncode != 0:
+    if check and process.returncode != 0:
         raise SystemExit(f"command failed with exit code {process.returncode}: {banner.strip()}")
+    return process.returncode
 
 
 def feature_args(features: list) -> list:
     return ["--features", ",".join(features)] if features else []
 
 
-def build(root: Path, benches: list, features: dict, env: dict, log: Optional[TextIO]) -> None:
-    """Compiles every selected target before anything is measured.
+def build(
+    root: Path,
+    benches: list,
+    features: dict,
+    env: dict,
+    log: Optional[TextIO],
+    tolerate_failures: bool = False,
+) -> list:
+    """Compiles every selected target before anything is measured, returning those that failed.
 
     Compile errors surface before a long run rather than halfway through, and compilation never
-    heats the machine between two measurements.
+    heats the machine between two measurements. A failure exits, unless `tolerate_failures`: then
+    a package that fails is retried target by target, and the targets that still fail are
+    returned so the caller can leave them out. That is for a base built with overlaid benchmark
+    sources, where a benchmark written against head's API may not compile against base's.
     """
     by_package: dict = {}
     for bench in benches:
-        by_package.setdefault(bench.package, []).append(bench.target)
-    for package, targets in by_package.items():
+        by_package.setdefault(bench.package, []).append(bench)
+    failed = []
+    for package, members in by_package.items():
         command = ["cargo", "bench", "--package", package, "--no-run"]
-        for target in targets:
-            command += ["--bench", target]
-        stream(command + feature_args(features[package]), root, env, log)
+        command += feature_args(features[package])
+        targets = [arg for bench in members for arg in ("--bench", bench.target)]
+        if stream(command + targets, root, env, log, check=not tolerate_failures) == 0:
+            continue
+        if len(members) == 1:
+            failed += members
+            continue
+        for bench in members:
+            if stream(command + ["--bench", bench.target], root, env, log, check=False) != 0:
+                failed.append(bench)
+    return failed
 
 
 def run_benches(
@@ -331,11 +368,16 @@ def run_benches(
     filter_regex: Optional[str],
     env: dict,
     log: Optional[TextIO],
+    failures: Optional[list] = None,
 ) -> None:
     """Runs each target on its own, so criterion's arguments reach criterion and nothing else.
 
     `cargo bench -p P -- ARGS` also passes ARGS to the library's libtest harness, which rejects
     criterion's options and aborts the whole run; `--bench T` avoids that.
+
+    A target that fails exits, unless `failures` is given: then it is recorded there and the
+    remaining targets still run. A comparison runs for an hour or more, and one benchmark process
+    killed from outside should cost that benchmark's round, not every result gathered so far.
     """
     for bench in benches:
         command = ["cargo", "bench", "--package", bench.package, "--bench", bench.target]
@@ -345,7 +387,10 @@ def run_benches(
             command += criterion_args + ["--save-baseline", baseline]
             if filter_regex:
                 command.append(filter_regex)
-        stream(command, root, env, log)
+        code = stream(command, root, env, log, check=failures is None)
+        if code != 0 and failures is not None:
+            print(f"\nwarning: {bench.key} failed (exit code {code}); continuing\n")
+            failures.append((bench.key, code))
 
 
 def criterion_args_from(args: argparse.Namespace) -> list:
@@ -370,6 +415,275 @@ def write_meta(criterion_home: Path, baseline: str, meta: dict) -> None:
 def read_meta(criterion_home: Path, baseline: str) -> Optional[dict]:
     path = criterion_home / META_DIR / f"{baseline}.json"
     return json.loads(path.read_text()) if path.exists() else None
+
+
+# --------------------------------------------------------------------------------------------
+# Benchmark overlay
+# --------------------------------------------------------------------------------------------
+#
+# A revision that predates part of the suite — upstream webrtc-rs/rtc, an old release — has only
+# some of these benchmarks, so a plain comparison against it measures only those. The overlay
+# copies head's benchmark sources into base's worktree and adds the manifest entries they need, so
+# both sides compile the same benchmark code and the one thing that differs is the library under
+# it. Manifests are read with `tomllib` but edited as text, so everything else in them is left
+# exactly as base has it.
+
+TABLE_HEADER = re.compile(r"^\[(\[?)\s*([^\]]+?)\s*\]\]?\s*(#.*)?$")
+ENTRY_KEY = re.compile(r'^\s*"?([A-Za-z0-9_-]+)"?\s*[.=]')
+STRING_OR_COMMENT = re.compile(r'"(?:\\.|[^"\\])*"|\'[^\']*\'|#.*')
+
+
+def split_tables(text: str) -> list:
+    """A manifest as `[header, body]` pairs in order, where `header` is a table's header line
+    (`""` for the keys before the first header) and `body` its lines, newlines kept. Joining
+    every header and body gives back the text exactly."""
+    tables: list = [["", []]]
+    for line in text.splitlines(keepends=True):
+        if TABLE_HEADER.match(line):
+            tables.append([line, []])
+        else:
+            tables[-1][1].append(line)
+    return tables
+
+
+def join_tables(tables: list) -> str:
+    return "".join(header + "".join(body) for header, body in tables)
+
+
+def table_name(header: str) -> tuple:
+    """`("array", "bench")` for `[[bench]]`, `("table", "features")` for `[features]`."""
+    match = TABLE_HEADER.match(header)
+    if not match:
+        return ("table", "")
+    return ("array" if match.group(1) else "table", match.group(2))
+
+
+def table_entries(body: list) -> list:
+    """`(key, start, end)` for each entry in a table body: the lines `body[start:end]`, with
+    multi-line arrays and inline tables kept together. `key` is a dotted key's first segment, so
+    `criterion.workspace = true` is an entry for `criterion`."""
+    entries: list = []
+    depth = 0
+    for index, line in enumerate(body):
+        if depth > 0 and entries:
+            entries[-1][2] = index + 1
+        else:
+            match = ENTRY_KEY.match(line)
+            if not match:
+                continue
+            entries.append([match.group(1), index, index + 1])
+        code = STRING_OR_COMMENT.sub("", line)
+        opened = code.count("[") + code.count("{")
+        closed = code.count("]") + code.count("}")
+        depth = max(0, depth + opened - closed)
+    return [tuple(entry) for entry in entries]
+
+
+def entry_text(tables: list, section: str, key: str) -> Optional[str]:
+    """The text of every entry for `key` in table `[section]`, or `None`."""
+    for header, body in tables:
+        if table_name(header) == ("table", section):
+            text = "".join(
+                "".join(body[start:end]) for name, start, end in table_entries(body) if name == key
+            )
+            return text or None
+    return None
+
+
+def insert_entry(tables: list, section: str, text: str) -> None:
+    """Adds `text` at the end of table `[section]`, creating the table if there is none."""
+    for header, body in tables:
+        if table_name(header) == ("table", section):
+            last = max((i for i, line in enumerate(body) if line.strip()), default=-1)
+            body.insert(last + 1, text)
+            return
+    append_table(tables, f"[{section}]\n", [text])
+
+
+def append_table(tables: list, header: str, body: list) -> None:
+    """Adds a table at the end, separated from what precedes it by a blank line."""
+    body = list(body)
+    while body and not body[-1].strip():
+        body.pop()
+    if body and not body[-1].endswith("\n"):
+        body[-1] += "\n"
+    previous_body = tables[-1][1]
+    if previous_body and not previous_body[-1].endswith("\n"):
+        previous_body[-1] += "\n"
+    tables.append(["\n" + header, body])
+
+
+def workspace_dependencies(manifest: dict, tables: tuple) -> set:
+    """Names that `manifest` takes from `[workspace.dependencies]` in the given tables."""
+    return {
+        name
+        for table in tables
+        for name, spec in manifest.get(table, {}).items()
+        if isinstance(spec, dict) and spec.get("workspace")
+    }
+
+
+def merge_manifest(head_manifest: Path, base_manifest: Path, features: list) -> tuple:
+    """Adds to `base_manifest` the `[[bench]]` targets and dev-dependencies that `head_manifest`
+    has and it lacks, and any of `features` that it does not define.
+
+    Returns what was added, for the report, and the names of the added dev-dependencies that come
+    from `[workspace.dependencies]`, which base's root manifest must then define too.
+    """
+    head_text, base_text = head_manifest.read_text(), base_manifest.read_text()
+    head, base = tomllib.loads(head_text), tomllib.loads(base_text)
+    head_tables, tables = split_tables(head_text), split_tables(base_text)
+    added = []
+
+    base_benches = {bench.get("name") for bench in base.get("bench", [])}
+    for header, body in head_tables:
+        if table_name(header) == ("array", "bench"):
+            name = tomllib.loads("".join(body)).get("name")
+            if name not in base_benches:
+                append_table(tables, header, body)
+                added.append(f"`[[bench]] {name}`")
+
+    dev_dependencies = sorted(
+        set(head.get("dev-dependencies", {})) - set(base.get("dev-dependencies", {}))
+    )
+    missing_features = [
+        feature
+        for feature in features
+        if feature in head.get("features", {}) and feature not in base.get("features", {})
+    ]
+    for section, keys in (("dev-dependencies", dev_dependencies), ("features", missing_features)):
+        for key in keys:
+            text = entry_text(head_tables, section, key)
+            if text:
+                insert_entry(tables, section, text)
+                added.append(f"`{section}.{key}`")
+
+    if added:
+        base_manifest.write_text(join_tables(tables))
+    needs = workspace_dependencies(
+        {"dev-dependencies": {k: head["dev-dependencies"][k] for k in dev_dependencies}},
+        ("dev-dependencies",),
+    )
+    return added, needs
+
+
+def merge_workspace(
+    head_manifest: Path, base_manifest: Path, members: list, dependencies: set
+) -> list:
+    """Adds `members` to base's workspace, and every name in `dependencies` that base's
+    `[workspace.dependencies]` lacks, taking each entry's text from head's root manifest."""
+    head_text, base_text = head_manifest.read_text(), base_manifest.read_text()
+    base = tomllib.loads(base_text)
+    head_tables, tables = split_tables(head_text), split_tables(base_text)
+    added = []
+
+    new_members = [m for m in members if m not in base.get("workspace", {}).get("members", [])]
+    if new_members:
+        for header, body in tables:
+            if table_name(header) != ("table", "workspace"):
+                continue
+            for name, start, end in table_entries(body):
+                if name != "members":
+                    continue
+                text = "".join(body[start:end])
+                close = text.rfind("]")
+                before = text[:close].rstrip()
+                separator = "" if before.endswith(("[", ",")) else ","
+                listed = "".join(f'\n    "{member}",' for member in new_members)
+                body[start:end] = [before + separator + listed + "\n" + text[close:]]
+                added += [f"workspace member `{member}`" for member in new_members]
+                break
+
+    have = set(base.get("workspace", {}).get("dependencies", {}))
+    for name in sorted(dependencies - have):
+        text = entry_text(head_tables, "workspace.dependencies", name)
+        if text:
+            insert_entry(tables, "workspace.dependencies", text)
+            added.append(f"`workspace.dependencies.{name}`")
+
+    if added:
+        base_manifest.write_text(join_tables(tables))
+    return added
+
+
+def copy_changed(source: Path, destination: Path) -> int:
+    """Copies the files under `source` that are missing or different under `destination`,
+    skipping build output, and returns how many were copied."""
+    copied = 0
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        if not path.is_file() or "target" in relative.parts:
+            continue
+        target = destination / relative
+        if target.exists() and target.read_bytes() == path.read_bytes():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+        copied += 1
+    return copied
+
+
+def overlay_benchmarks(head_root: Path, base_root: Path) -> list:
+    """Makes `base_root` build and run head's benchmarks, returning notes for the report.
+
+    For every head package with bench targets: a package base does not have at all — the
+    benchmark-only `benchmarks/rtc-bench` — is copied whole and added to base's workspace;
+    otherwise the directories holding its bench sources are copied over base's, and base's
+    manifest gains the bench targets, dev-dependencies and bench features it lacks.
+    """
+    base_packages = {package["name"]: package for package in workspace_packages(base_root)}
+    copied: list = []
+    manifest_changes: list = []
+    new_members: list = []
+    dependencies: set = set()
+
+    for package in workspace_packages(head_root):
+        targets = [target for target in package["targets"] if "bench" in target["kind"]]
+        if not targets:
+            continue
+        head_dir = Path(package["manifest_path"]).parent
+        relative = head_dir.relative_to(head_root)
+
+        if package["name"] not in base_packages:
+            if copy_changed(head_dir, base_root / relative):
+                copied.append(f"`{relative.as_posix()}/`")
+            new_members.append(relative.as_posix())
+            head_manifest = tomllib.loads((head_dir / "Cargo.toml").read_text())
+            dependencies |= workspace_dependencies(
+                head_manifest, ("dependencies", "dev-dependencies", "build-dependencies")
+            )
+            continue
+
+        base_dir = Path(base_packages[package["name"]]["manifest_path"]).parent
+        for source_dir in sorted({Path(target["src_path"]).parent for target in targets}):
+            if source_dir == head_dir or not source_dir.is_relative_to(head_dir):
+                continue
+            destination = base_dir / source_dir.relative_to(head_dir)
+            if copy_changed(source_dir, destination):
+                copied.append(f"`{source_dir.relative_to(head_root).as_posix()}/`")
+
+        features = list(EXTRA_FEATURES.get(package["name"], []))
+        features += [f for target in targets for f in target.get("required-features", [])]
+        added, needs = merge_manifest(
+            head_dir / "Cargo.toml", base_dir / "Cargo.toml", features
+        )
+        dependencies |= needs
+        if added:
+            manifest_changes.append(f"{package['name']}: {', '.join(added)}")
+
+    added = merge_workspace(
+        head_root / "Cargo.toml", base_root / "Cargo.toml", new_members, dependencies
+    )
+    if added:
+        manifest_changes.append(f"workspace: {', '.join(added)}")
+
+    notes = [
+        "Base ran head's benchmark sources, overlaid onto it, so both sides run identical "
+        "benchmark code: " + (", ".join(copied) if copied else "no source differed") + "."
+    ]
+    if manifest_changes:
+        notes.append("Added to base's manifests for them: " + "; ".join(manifest_changes) + ".")
+    return notes
 
 
 # --------------------------------------------------------------------------------------------
@@ -490,8 +804,9 @@ def describe_environment(meta: Optional[dict]) -> list:
 def describe_revision(meta: Optional[dict], fallback: str) -> str:
     if not meta:
         return f"`{fallback}`"
+    title = f"{meta['title']}: " if meta.get("title") else ""
     suffix = " + uncommitted changes" if meta.get("dirty") else ""
-    return f"`{meta['revision'][:10]}` {meta['subject']}{suffix}"
+    return f"{title}`{meta['revision'][:10]}` {meta['subject']}{suffix}"
 
 
 def summary_report(criterion_home: Path, baseline: str) -> str:
@@ -552,8 +867,12 @@ def comparison_report(
             f"{change:+.1f}% | {verdict} |"
         )
 
+    titles = [
+        (meta or {}).get("title", "").split(" (")[0] or name
+        for meta, name in ((base_meta, base), (head_meta, head))
+    ]
     lines = [
-        f"## Benchmark comparison: {base} → {head}",
+        f"## Benchmark comparison: {titles[0]} → {titles[1]}",
         "",
         "| | |",
         "|---|---|",
@@ -655,15 +974,23 @@ def command_check(args: argparse.Namespace) -> None:
     print(f"\nAll {len(benches)} benchmark targets built and ran once.")
 
 
-def prepare_worktree(revision: str, worktree_dir: Path) -> Path:
+def prepare_worktree(revision: str, worktree_dir: Path, overlay: bool = False) -> Path:
     """A detached worktree at `revision`, reused across comparisons against the same revision so
-    its `target/` stays warm."""
+    its `target/` stays warm.
+
+    An `overlay` worktree is kept apart from the plain one and restored to `revision` each time —
+    tracked files reset, untracked ones removed, ignored ones such as `target/` kept — so a
+    previous overlay never leaks into this one, and never into a plain comparison.
+    """
     sha = git(ROOT, "rev-parse", "--verify", f"{revision}^{{commit}}")
-    path = worktree_dir / f"{ROOT.name}-{sha[:12]}"
+    path = worktree_dir / f"{ROOT.name}-{sha[:12]}{'-overlay' if overlay else ''}"
     git(ROOT, "worktree", "prune")
     if path.exists():
         if git(path, "rev-parse", "HEAD") != sha:
             raise SystemExit(f"{path} exists but is not at {sha}; remove it and retry")
+        if overlay:
+            git(path, "reset", "--hard", "--quiet")
+            git(path, "clean", "-d", "--force", "--quiet")
         print(f"Reusing worktree {path}")
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -704,18 +1031,79 @@ def dependency_drift(base_root: Path, head_root: Path) -> list:
 
 
 def command_compare(args: argparse.Namespace) -> None:
+    compare_revisions(args, args.base, overlay=args.overlay_benches)
+
+
+def repository_name(url: str) -> str:
+    """`owner/repo` for an HTTPS or SSH remote URL, such as
+    `https://github.com/webrtc-rs/rtc.git` or `git@github.com:webrtc-rs/rtc.git`."""
+    path = re.sub(r"\.git$", "", url.rstrip("/"))
+    return "/".join(re.split(r"[/:]", path)[-2:])
+
+
+def fetch_upstream(url: str, branch: str, fetch: bool) -> str:
+    """Fetches `branch` from `url` into a private ref and returns that ref."""
+    ref = UPSTREAM_REF_PREFIX + branch
+    if fetch:
+        print(f"Fetching {branch} from {url}")
+        subprocess.run(
+            ["git", "fetch", "--no-tags", "--quiet", url, f"+refs/heads/{branch}:{ref}"],
+            cwd=ROOT,
+            check=True,
+        )
+    elif subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref], cwd=ROOT, capture_output=True
+    ).returncode != 0:
+        raise SystemExit(f"{ref} has not been fetched yet; run without --no-fetch")
+    return ref
+
+
+def command_upstream(args: argparse.Namespace) -> None:
+    ref = fetch_upstream(args.url, args.branch, fetch=not args.no_fetch)
+    try:
+        origin = repository_name(git(ROOT, "remote", "get-url", "origin"))
+    except subprocess.CalledProcessError:
+        origin = "this repository"
+    compare_revisions(
+        args,
+        ref,
+        overlay=True,
+        titles=(
+            f"upstream ({repository_name(args.url)} {args.branch})",
+            f"fork ({origin}{'' if args.head else ', working tree'})",
+        ),
+        results_prefix="upstream-",
+    )
+
+
+def compare_revisions(
+    args: argparse.Namespace,
+    base_revision: str,
+    overlay: bool,
+    titles: tuple = (None, None),
+    results_prefix: str = "",
+) -> None:
+    """Builds `base_revision` in a worktree and compares it with head — `args.head`, or the
+    working tree — alternating the two for `args.rounds` rounds.
+
+    With `overlay`, base first gets head's benchmark sources (see `overlay_benchmarks`), and a
+    benchmark that does not compile against base's API is left out of base rather than failing
+    the comparison.
+    """
     warn_about_environment()
     worktree_dir = Path(args.worktree_dir).expanduser().resolve()
-    base_root = prepare_worktree(args.base, worktree_dir)
+    base_root = prepare_worktree(base_revision, worktree_dir, overlay=overlay)
     head_root = prepare_worktree(args.head, worktree_dir) if args.head else ROOT
     notes = [note for note in [seed_lockfile(head_root, base_root)] if note]
+    if overlay:
+        notes += overlay_benchmarks(head_root, base_root)
 
     base_label = git(base_root, "rev-parse", "--short", "HEAD")
     head_label = revision_label(head_root)
     criterion_home = (
         Path(args.criterion_home).resolve()
         if args.criterion_home
-        else ROOT / "target" / "bench-compare" / f"{base_label}-vs-{head_label}"
+        else ROOT / "target" / "bench-compare" / f"{results_prefix}{base_label}-vs-{head_label}"
     )
     if criterion_home.exists():
         shutil.rmtree(criterion_home)
@@ -741,8 +1129,15 @@ def command_compare(args: argparse.Namespace) -> None:
 
     with (criterion_home / "compare.log").open("w") as log:
         # Build both sides before measuring either.
-        for name, (root, chosen, features) in sides.items():
-            build(root, chosen, features, env, log)
+        for name, (root, chosen, features) in list(sides.items()):
+            tolerate = overlay and name == "base"
+            failed = build(root, chosen, features, env, log, tolerate_failures=tolerate)
+            if failed:
+                keys = ", ".join(f"`{bench.key}`" for bench in failed)
+                print(f"\nwarning: {keys} did not build at base; comparing the rest\n")
+                notes.append(f"Did not build at base, so measured at head only: {keys}")
+                chosen = [bench for bench in chosen if bench not in failed]
+                sides[name] = (root, chosen, features)
 
         drift = dependency_drift(base_root, head_root)
         if drift:
@@ -754,6 +1149,7 @@ def command_compare(args: argparse.Namespace) -> None:
         for round_index in range(1, args.rounds + 1):
             for name, (root, chosen, features) in sides.items():
                 print(f"\n=== round {round_index}/{args.rounds}: {name} ({root}) ===\n")
+                failures: list = []
                 run_benches(
                     root,
                     chosen,
@@ -763,12 +1159,24 @@ def command_compare(args: argparse.Namespace) -> None:
                     args.filter,
                     env,
                     log,
+                    failures,
                 )
+                for key, code in failures:
+                    notes.append(
+                        f"`{key}` failed at {name} in round {round_index} (exit code {code}); "
+                        "its rows cover the rounds, and the benchmarks within that round, that "
+                        "completed"
+                    )
 
     metas = {}
-    for name, (root, chosen, features) in sides.items():
+    for (name, (root, chosen, features)), title in zip(sides.items(), titles):
         meta = environment(root)
         meta.update(criterion_args=criterion, benches=[b.key for b in chosen], features=features)
+        if title:
+            meta["title"] = title
+        if overlay and name == "base":
+            # The overlay's edits are not changes to the revision being measured.
+            meta["dirty"] = False
         write_meta(criterion_home, name, meta)
         metas[name] = meta
 
@@ -862,35 +1270,63 @@ def main() -> None:
         help="where criterion writes results (default: target/criterion)",
     )
 
+    def comparison(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument(
+            "--head", help="a revision to use instead of the current working tree"
+        )
+        selection(sub)
+        sub.add_argument(
+            "--rounds",
+            type=int,
+            default=1,
+            help="alternate base and head this many times; 3 is advisable for quoting",
+        )
+        sub.add_argument(
+            "--threshold",
+            type=float,
+            default=3.0,
+            metavar="PERCENT",
+            help="changes smaller than this are reported as noise (default: 3)",
+        )
+        sub.add_argument(
+            "--worktree-dir",
+            default=str(DEFAULT_WORKTREE_DIR),
+            help=f"where base worktrees live (default: {DEFAULT_WORKTREE_DIR})",
+        )
+        sub.add_argument(
+            "--criterion-home",
+            help="results directory (default: under target/bench-compare/, emptied first)",
+        )
+
     compare = commands.add_parser(
         "compare", help="build BASE in a worktree and compare it with HEAD on this machine"
     )
     compare.add_argument("base", help="the revision to compare against")
+    comparison(compare)
     compare.add_argument(
-        "--head", help="a revision to use instead of the current working tree"
+        "--overlay-benches",
+        action="store_true",
+        help="run head's benchmark sources at base too, for a base that predates part of the suite",
     )
-    selection(compare)
-    compare.add_argument(
-        "--rounds",
-        type=int,
-        default=1,
-        help="alternate base and head this many times; 3 is advisable for quoting",
+
+    upstream = commands.add_parser(
+        "upstream",
+        help="fetch upstream webrtc-rs/rtc and compare this fork with it, both sides running "
+        "this tree's benchmarks",
     )
-    compare.add_argument(
-        "--threshold",
-        type=float,
-        default=3.0,
-        metavar="PERCENT",
-        help="changes smaller than this are reported as noise (default: 3)",
+    comparison(upstream)
+    upstream.add_argument(
+        "--url", default=UPSTREAM_URL, help=f"upstream repository (default: {UPSTREAM_URL})"
     )
-    compare.add_argument(
-        "--worktree-dir",
-        default=str(DEFAULT_WORKTREE_DIR),
-        help=f"where base worktrees live (default: {DEFAULT_WORKTREE_DIR})",
+    upstream.add_argument(
+        "--branch",
+        default=UPSTREAM_BRANCH,
+        help=f"upstream branch to compare against (default: {UPSTREAM_BRANCH})",
     )
-    compare.add_argument(
-        "--criterion-home",
-        help="results directory (default: target/bench-compare/BASE-vs-HEAD, emptied first)",
+    upstream.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help=f"use the branch as last fetched into {UPSTREAM_REF_PREFIX}BRANCH",
     )
 
     report = commands.add_parser(
@@ -913,6 +1349,7 @@ def main() -> None:
         "check": command_check,
         "run": command_run,
         "compare": command_compare,
+        "upstream": command_upstream,
         "report": command_report,
     }[args.command](args)
 

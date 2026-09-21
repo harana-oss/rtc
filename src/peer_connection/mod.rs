@@ -2567,9 +2567,9 @@ mod tests {
     }
 
     // W3C types `maxMessageSize` `unrestricted double` so that an implementation with no limit
-    // can report +Infinity. This one always has a limit — the working buffer is a real
-    // allocation — so a configuration naming no limit resolves to the implementation ceiling,
-    // and the value reported is the value enforced.
+    // can report +Infinity. This one always has a limit — each message is reassembled into a
+    // single allocation — so a configuration naming no limit resolves to the implementation
+    // ceiling, and the value reported is the value enforced.
     #[test]
     fn max_message_size_with_no_configured_limit_reports_the_ceiling() {
         let setting_engine = SettingEngineBuilder::new()

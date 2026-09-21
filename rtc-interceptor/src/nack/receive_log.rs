@@ -64,11 +64,17 @@ impl ReceiveLog {
             }
             d if d < UINT16_SIZE_HALF => {
                 // Positive diff: seq > end (with wraparound handling)
-                // Clear packets between end and seq (they may contain old data)
-                let mut i = self.end.wrapping_add(1);
-                while i != seq {
-                    self.del_received(i);
-                    i = i.wrapping_add(1);
+                // Clear packets between end and seq (they may contain old data). A gap as wide
+                // as the window clears every bit, so clear them at once rather than one skipped
+                // sequence number at a time — a jump can skip up to 32,767 of them.
+                if d > self.size {
+                    self.packets.fill(0);
+                } else {
+                    let mut i = self.end.wrapping_add(1);
+                    while i != seq {
+                        self.del_received(i);
+                        i = i.wrapping_add(1);
+                    }
                 }
                 self.end = seq;
 
@@ -125,6 +131,19 @@ impl ReceiveLog {
         }
 
         missing
+    }
+
+    /// Whether `seq` is one [`Self::missing_seq_numbers`] would report for `skip_last_n`, in
+    /// constant time.
+    pub(crate) fn is_missing(&self, seq: u16, skip_last_n: u16) -> bool {
+        let until = self.end.wrapping_sub(skip_last_n);
+        let span = until.wrapping_sub(self.last_consecutive);
+        if span >= UINT16_SIZE_HALF {
+            return false;
+        }
+        // `missing_seq_numbers` walks `last_consecutive + 1 ..= until`.
+        let offset = seq.wrapping_sub(self.last_consecutive);
+        offset != 0 && offset <= span && !self.get_received(seq)
     }
 
     fn set_received(&mut self, seq: u16) {
@@ -298,5 +317,44 @@ mod tests {
             assert_eq!(missing, vec![start.wrapping_add(129)]);
             assert_eq!(rl.last_consecutive, start.wrapping_add(128));
         }
+    }
+
+    /// `is_missing` answers exactly the membership question `missing_seq_numbers` implies, for
+    /// every sequence number, across loss, reordering, a large jump and the wrap.
+    #[test]
+    fn test_receive_log_is_missing_matches_missing_seq_numbers() {
+        let mut log = ReceiveLog::new(128).unwrap();
+        let arrivals = [
+            65_500u16, 65_501, 65_503, 65_510, 65_502, 65_535, 3, 7, 6, 20, 500, 505, 501,
+        ];
+        for &seq in &arrivals {
+            log.add(seq);
+            for skip_last_n in [0, 2, 5] {
+                let missing = log.missing_seq_numbers(skip_last_n);
+                for candidate in 0..=u16::MAX {
+                    assert_eq!(
+                        log.is_missing(candidate, skip_last_n),
+                        missing.contains(&candidate),
+                        "seq {candidate} after adding {seq}, skip_last_n {skip_last_n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Clearing the whole bitmap for a jump wider than the window leaves exactly what clearing
+    /// each skipped number would.
+    #[test]
+    fn test_receive_log_large_jump_clears_the_window() {
+        let mut log = ReceiveLog::new(64).unwrap();
+        for seq in 0..64 {
+            log.add(seq);
+        }
+        log.add(10_000);
+        for seq in 10_000u16 - 63..10_000 {
+            assert!(!log.get(seq), "{seq} was never received");
+        }
+        assert!(log.get(10_000));
+        assert!(!log.get(0), "outside the window");
     }
 }

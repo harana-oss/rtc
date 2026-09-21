@@ -13,4 +13,5 @@ and compare it; `python3 scripts/bench.py list` prints every target.
 python3 scripts/bench.py run --bench rtc-bench:data_channel   # one end-to-end target
 python3 scripts/bench.py run -p rtc-bench --providers all     # all of them, both crypto backends
 python3 scripts/bench.py run --bench rtc-bench:allocations     # allocations per packet and message
+python3 scripts/bench.py upstream --rounds 3                    # this fork vs. upstream webrtc-rs/rtc
 ```
