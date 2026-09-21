@@ -5,6 +5,24 @@ or additions to the main workspace benchmark suite. They compare small kernels u
 buffers, rotated sample order, and upper medians. They do not provide confidence intervals
 or predict whole-stack performance.
 
+## What shipped
+
+Each probe's idea is now implemented in the library, portably, and measured by a criterion
+benchmark; SIMD.md's sections record the results.
+
+| Probe | Production | Benchmark |
+|---|---|---|
+| `annexb_scan` | `H264Payloader::next_ind` and `H26xReader::next_nal`, with a prebuilt `memchr::memmem::Finder` | `rtc-rtp:bench` `H264/Payload/*`, `rtc-media:h26x` |
+| `receiver_loss` | `rtc-interceptor/src/bitmap.rs`, used by receiver reports and the NACK receive log | `rtc-interceptor:feedback` |
+| `ogg_crc` | `PageChecksum` in `rtc-media/src/io/ogg_reader`, on the `crc-fast` crate | `rtc-media:ogg` |
+
+The Ogg probe used ARM intrinsics (`std::arch::aarch64`: NEON bit reversal around the CRC32
+instructions) and runs only on aarch64. Production does not: `crc-fast` folds with carry-less
+multiplication on x86, x86-64 and aarch64, detected at runtime, and falls back to slice-by-16 tables
+elsewhere. Timed back to back on the same M1 Max it was 2.7× faster than the probe's best variant
+at 1,200 bytes (45.5 against 121.6 ns) and 4.7× at 65,307 (1.60 against 7.59 µs): folding needs no
+per-byte bit reversal.
+
 From the repository root, test the portable probes before timing:
 
 ```sh

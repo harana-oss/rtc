@@ -134,33 +134,22 @@ impl NackResponderInterceptor {
     }
 
     /// Handle a NACK request by queuing retransmissions.
+    ///
+    /// Retransmits in the order the request lists them: pair by pair, each pair's base packet
+    /// first and then the packets its bitmask names, ascending (wrapping).
     fn handle_nack(
         &mut self,
         now: Instant,
         nack: &rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack,
     ) {
-        // Collect sequence numbers to retransmit
-        let mut seqs_to_retransmit = Vec::new();
-
-        for nack_pair in &nack.nacks {
-            // Check the base packet ID
-            seqs_to_retransmit.push(nack_pair.packet_id);
-
-            // Check each bit in lost_packets bitmap
-            for i in 0..16 {
-                if nack_pair.lost_packets & (1 << i) != 0 {
-                    let seq = nack_pair.packet_id.wrapping_add(i + 1);
-                    seqs_to_retransmit.push(seq);
-                }
-            }
-        }
-
         let Some(stream) = self.streams.get_mut(&nack.media_ssrc) else {
             return;
         };
 
-        // Queue retransmissions
-        for seq in seqs_to_retransmit {
+        // Each pair's iterator finds its set bits with `trailing_zeros` rather than testing all
+        // 16 positions. The stream and the write queue are separate fields, so the sequence
+        // numbers go straight to the send-buffer lookup without being collected first.
+        for seq in nack.nacks.iter().flat_map(|&pair| pair) {
             let Some(original_packet) = stream.send_buffer.get(seq, now) else {
                 continue;
             };
@@ -309,4 +298,139 @@ impl Interceptor for NackResponderInterceptor {
     fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
 
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream_info::RTCPFeedback;
+    use rtcp::transport_feedbacks::transport_layer_nack::{NackPair, TransportLayerNack};
+
+    const SSRC: u32 = 7;
+    const RTX_SSRC: u32 = 8;
+
+    /// The order `handle_nack` retransmitted in before it used `NackPair`'s iterator: all 16
+    /// bitmask positions tested for each pair, after its base packet.
+    fn reference_order(nack: &TransportLayerNack) -> Vec<u16> {
+        let mut seqs = Vec::new();
+        for nack_pair in &nack.nacks {
+            seqs.push(nack_pair.packet_id);
+            for i in 0..16 {
+                if nack_pair.lost_packets & (1 << i) != 0 {
+                    seqs.push(nack_pair.packet_id.wrapping_add(i + 1));
+                }
+            }
+        }
+        seqs
+    }
+
+    fn responder(rtx: bool) -> NackResponderInterceptor {
+        let mut responder = NackResponderBuilder::new()
+            .with_size(512)
+            .with_max_age(None)
+            .build();
+        responder.bind_local_stream(&StreamInfo {
+            ssrc: SSRC,
+            ssrc_rtx: rtx.then_some(RTX_SSRC),
+            payload_type_rtx: rtx.then_some(97),
+            rtcp_feedback: vec![RTCPFeedback {
+                typ: "nack".to_string(),
+                parameter: String::new(),
+            }],
+            ..Default::default()
+        });
+        responder
+    }
+
+    /// Retransmissions come out in the order the per-position scan produced, with and without
+    /// RTX: base packet first, bitmask packets ascending and wrapping past 65535, pairs in
+    /// request order, repeats retransmitted again, and packets not in the history skipped.
+    #[test]
+    fn retransmission_order_matches_per_position_scan() {
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let now = Instant::now();
+        for rtx in [false, true] {
+            let mut responder = responder(rtx);
+            // 512 packets of history ending just past the wrap: 65_300 ..= 275.
+            for i in 0..512u16 {
+                let seq = 65_300u16.wrapping_add(i);
+                responder
+                    .handle_write(TaggedPacket {
+                        now,
+                        transport: TransportContext::default(),
+                        message: AttributedPacket::new(Packet::Rtp(rtp::Packet {
+                            header: rtp::header::Header {
+                                version: 2,
+                                ssrc: SSRC,
+                                sequence_number: seq,
+                                ..Default::default()
+                            },
+                            payload: seq.to_be_bytes().to_vec().into(),
+                        })),
+                    })
+                    .unwrap();
+            }
+            while responder.poll_write().is_some() {}
+
+            let mut rtx_seq = 0u16;
+            for round in 0..200 {
+                let nacks = (0..1 + next() % 6)
+                    .map(|_| NackPair {
+                        // Mostly inside the history, sometimes around its edges.
+                        packet_id: 65_280u16.wrapping_add((next() % 560) as u16),
+                        lost_packets: match round % 4 {
+                            0 => next() as u16,
+                            1 => u16::MAX,
+                            2 => 1 << (next() % 16),
+                            _ => 0,
+                        },
+                    })
+                    .collect();
+                let nack = TransportLayerNack {
+                    sender_ssrc: 1,
+                    media_ssrc: SSRC,
+                    nacks,
+                };
+                let stream = &responder.streams[&SSRC];
+                let expected: Vec<u16> = reference_order(&nack)
+                    .into_iter()
+                    .filter(|&seq| stream.send_buffer.get(seq, now).is_some())
+                    .collect();
+
+                responder
+                    .handle_read(TaggedPacket {
+                        now,
+                        transport: TransportContext::default(),
+                        message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(nack)])),
+                    })
+                    .unwrap();
+                while responder.poll_read().is_some() {}
+
+                let mut got = Vec::new();
+                while let Some(sent) = responder.poll_write() {
+                    let Packet::Rtp(packet) = &sent.message.packet else {
+                        panic!("only retransmissions are queued");
+                    };
+                    if rtx {
+                        assert_eq!(packet.header.ssrc, RTX_SSRC);
+                        assert_eq!(packet.header.sequence_number, rtx_seq);
+                        rtx_seq = rtx_seq.wrapping_add(1);
+                        // RFC 4588: the original sequence number leads the payload, followed
+                        // by the original payload, which is that number again.
+                        assert_eq!(packet.payload[..2], packet.payload[2..]);
+                    } else {
+                        assert_eq!(packet.header.ssrc, SSRC);
+                    }
+                    got.push(u16::from_be_bytes([packet.payload[0], packet.payload[1]]));
+                }
+                assert_eq!(got, expected, "round {round}, rtx {rtx}");
+            }
+        }
+    }
 }

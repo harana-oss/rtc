@@ -14,6 +14,7 @@ command.
 - [Comparing two revisions](#comparing-two-revisions)
 - [Comparing with upstream](#comparing-with-upstream)
 - [RUSTFLAGS silently changes the numbers](#rustflags-silently-changes-the-numbers)
+- [Builds outside this repository](#builds-outside-this-repository)
 - [The end-to-end harness](#the-end-to-end-harness)
 - [Allocations per packet](#allocations-per-packet)
 - [Not covered yet](#not-covered-yet)
@@ -60,10 +61,16 @@ and without the default interceptor chain.
 | `rtc-sctp:bench` | `SCTP/Transfer/reliable/<size>`, `SCTP/Packet/{marshal,unmarshal}/*` |
 | `rtc-shared:replay_detector` | `ReplayDetector/{SlidingWindow,WrappedSlidingWindow}/{in-order,reordered,duplicate}/<window>` |
 | `rtc-ice:bench` | `ICE/Candidate/{marshal,unmarshal}/<form>` |
-| `rtc-stun:bench`, `rtc-turn:bench` | message and attribute encode/decode, integrity, fingerprint |
-| `rtc-rtp:bench`, `rtc-rtcp:bench` | packet marshal and unmarshal |
+| `rtc-stun:bench`, `rtc-turn:bench` | message and attribute encode/decode, integrity, fingerprint; `Fingerprint/value/<size>` is the CRC alone across STUN message sizes |
+| `rtc-rtp:bench` | packet marshal and unmarshal; `H264/Payload/*`, H.264 packetization including the Annex B start-code scan |
+| `rtc-rtcp:bench` | packet marshal and unmarshal; `CCFB/{Marshal,Unmarshal}/*`, RFC 8888 feedback at MTU size, contiguous and fragmented |
 | `rtc-sdp:bench` | session description marshal and unmarshal |
-| `rtc-media:bench` | audio buffer interleaving |
+| `rtc-media:bench` | `Audio/{Deinterleave,Interleave,FromBytes}/*`, audio buffer layout conversion |
+| `rtc-media:pcm` | `Audio/PCM/*`, `i16`/`f32` sample conversion, per sample and a slice at a time |
+| `rtc-media:h26x` | `H26x/Reader/*`, reading an Annex B stream into NAL units |
+| `rtc-media:ogg` | `Ogg/{Write,Read}/*`, whole Ogg pages including the page checksum |
+| `rtc-interceptor:feedback` | `Feedback/{NackGenerator,NackResponder,ReceiverReport,TwccReceiver}/*`, feedback interceptors under loss and gaps |
+| `rtc-interceptor:flexfec` | `FlexFec/{Encode,Recover,RecoverRepair}/*`, FlexFEC-03 repair packets |
 | `rtc-interceptor:congestion_control` | behaviour report, not a criterion benchmark |
 
 The two report targets are not run by `bench.py run` unless named (`--bench
@@ -216,25 +223,39 @@ applies unchanged: same machine, alternating rounds, `--rounds 3` for anything y
 ## RUSTFLAGS silently changes the numbers
 
 An exported `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` **replaces** the rustflags in
-`.cargo/config.toml` rather than adding to them. On aarch64 that drops `--cfg aes_armv8` and
-`--cfg polyval_armv8`, and RustCrypto's AES falls back to its constant-time software
-implementation. Even something as innocuous as `RUSTFLAGS=-Awarnings` does this.
+`.cargo/config.toml` rather than adding to them, and whatever it adds — a `target-cpu`, a codegen
+option — applies to every crate. Even something as innocuous as `RUSTFLAGS=-Awarnings` changes what
+is built.
 
-Measured on an M1 Max: `SRTP/Encrypt/RTP` (AES-128-CM-HMAC-SHA1-80) takes **7.28 µs** with
-`RUSTFLAGS=-Awarnings` and **1.72 µs** with `RUSTFLAGS="-Awarnings --cfg aes_armv8 --cfg
-polyval_armv8"`. That is 4.2×, on a path that is otherwise unchanged. The AEAD path, which runs on
-`ring`, is unaffected at about 313 ns either way. So an asymmetry between cipher suites is the
-signature of this problem.
+This used to cost 4× on SRTP. `rtc-crypto` ran on `aes` 0.8, whose ARMv8 backend was compiled in
+only with `--cfg aes_armv8`, which the config supplied. Measured on an M1 Max, `SRTP/Encrypt/RTP`
+(AES-128-CM-HMAC-SHA1-80) took **7.28 µs** with `RUSTFLAGS=-Awarnings` and **1.72 µs** with the
+cfgs added back, while the AEAD path on `ring` stayed at about 313 ns either way. An asymmetry
+between cipher suites was the signature. `rtc-crypto` now uses `aes` 0.9, which detects the
+hardware at runtime, so no rtc crate depends on the config's cfgs any more; they remain only for
+dev dependencies (see the comment in `.cargo/config.toml`).
 
-`bench.py` prints a warning when either variable is set and records its value in every report. If
-you need a flag, add the cfgs back alongside it:
+`bench.py` still prints a warning when either variable is set and records its value in every
+report. A comparison is sound as long as both sides see the same flags, which `compare`
+guarantees. The absolute numbers are what change.
+
+## Builds outside this repository
+
+The same mechanism has a second consequence, for applications rather than benchmarks: cargo reads
+`.cargo/config.toml` from the directory it runs in, so a project depending on rtc never gets this
+repository's rustflags. Every number measured here would stay fast while an application's build was
+slow, and no in-repository benchmark could notice. That was the case with `aes` 0.8: an application
+built on aarch64 got software AES, 27× slower on a 1,200-byte AES-128-CTR keystream.
 
 ```bash
-RUSTFLAGS="-Awarnings --cfg aes_armv8 --cfg polyval_armv8" python3 scripts/bench.py run
+python3 scripts/bench.py external
 ```
 
-A comparison is still sound as long as both sides see the same flags, which `compare` guarantees.
-The absolute numbers are what change.
+This builds [`benchmarks/external-consumer`](../benchmarks/external-consumer) three ways — from
+outside the repository with rustflags cleared, as an application would; from the repository root;
+and with RustCrypto's software AES forced, for reference — and fails if the first is more than 1.5×
+slower than the second on any RustCrypto path. Run it after changing crypto dependencies or
+`.cargo/config.toml`.
 
 ## The end-to-end harness
 
@@ -296,7 +317,9 @@ The harness is built to make these straightforward to add, but today it has none
 
 - **Loss, reordering and duplication.** The wire is a pair of FIFO queues. A lossy wire — dropping or
   reordering inside `PeerPair::pump` under a seeded RNG — would bring NACK, RTX, SCTP retransmission
-  and the replay window's reorder path into the end-to-end numbers.
+  and the replay window's reorder path into the end-to-end numbers. (`rtc-interceptor:feedback`
+  drives the NACK, receiver-report and TWCC interceptors under loss and gaps directly, but not
+  through a connection.)
 - **A consumer that stops reading.** `pump` always drains `poll_read`. Measuring back-pressure needs
   a driver that withholds it, as `tests/data_channel_backpressure_rtc2rtc.rs` does over sockets.
 - **Simulcast.** Tracks have one encoding each; RID-tagged layers and RTX pairing are not exercised.

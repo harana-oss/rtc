@@ -16,11 +16,16 @@ Usage:
     python3 scripts/bench.py compare BASE [--head REV] [--rounds N] [--overlay-benches] [...]
     python3 scripts/bench.py upstream [--branch B] [--rounds N] [--quick] [...]
     python3 scripts/bench.py report BASELINE [OTHER] [--criterion-home DIR]
+    python3 scripts/bench.py external
 
 `run` saves a named criterion baseline — by default the short commit, with `-dirty` appended for
 uncommitted changes — and prints a table of it. `report A B` compares any two saved baselines.
 Prefer `compare` for before/after questions: it builds BASE in a separate worktree and alternates
 BASE and HEAD runs in one session, which is the only comparison this workspace trusts.
+
+`external` builds `benchmarks/external-consumer` the way an application depending on rtc would —
+from outside this repository, so without its `.cargo/config.toml` — and checks that its AES paths
+run the same hardware backend as a build inside the repository.
 
 `upstream` is `compare` against webrtc-rs/rtc: it fetches the upstream branch, overlays this
 tree's benchmark sources onto it so both sides run identical benchmark code, and compares it with
@@ -266,8 +271,8 @@ def warn_about_environment() -> None:
     if os.environ.get("RUSTFLAGS") or os.environ.get("CARGO_ENCODED_RUSTFLAGS"):
         print(
             "warning: RUSTFLAGS is set. It replaces, rather than extends, the rustflags in "
-            ".cargo/config.toml — including the aarch64 AES/PMULL cfgs — so these numbers may not "
-            "match a default build.",
+            ".cargo/config.toml, and whatever it adds (target-cpu, codegen options) applies to "
+            "every crate, so these numbers may not match a default build.",
             file=sys.stderr,
         )
 
@@ -1207,6 +1212,131 @@ def command_report(args: argparse.Namespace) -> None:
     )
 
 
+# --------------------------------------------------------------------------------------------
+# External consumer
+# --------------------------------------------------------------------------------------------
+
+EXTERNAL_CONSUMER = ROOT / "benchmarks" / "external-consumer"
+
+# How much slower than the in-repository build a consumer build may time before it is reported as
+# not getting the same backend. The software backend measured ~14x slower on Apple M1; noise between
+# two hardware-backend runs is a few percent.
+EXTERNAL_TOLERANCE = 1.5
+
+
+def without_rustflags(env: dict) -> dict:
+    """`env` minus every variable that would replace the rustflags a build otherwise gets."""
+    return {
+        key: value
+        for key, value in env.items()
+        if key not in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS")
+        and not (key.startswith("CARGO_TARGET_") and key.endswith("_RUSTFLAGS"))
+    }
+
+
+def run_consumer(label: str, cwd: Path, env: dict, target_dir: Path) -> dict:
+    """Builds and runs the consumer from `cwd`, returning `case -> ns` plus its `cfg` lines."""
+    command = [
+        "cargo",
+        "run",
+        "--release",
+        "--quiet",
+        "--manifest-path",
+        str(EXTERNAL_CONSUMER / "Cargo.toml"),
+    ]
+    print(f"\n== {label} ==")
+    print(f"$ (cd {cwd} && {shlex.join(command)})")
+    output = subprocess.run(
+        command,
+        cwd=cwd,
+        env={**env, "CARGO_TARGET_DIR": str(target_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if output.returncode != 0:
+        sys.stderr.write(output.stderr)
+        raise SystemExit(f"{label}: the consumer build failed")
+    sys.stdout.write(output.stdout)
+    results: dict = {"times": {}, "info": {}}
+    for line in output.stdout.splitlines():
+        name, _, value = line.rpartition(": ")
+        if value.endswith(" ns"):
+            results["times"][name] = float(value[:-3])
+        elif name:
+            results["info"][name] = value
+    return results
+
+
+def command_external(args: argparse.Namespace) -> None:
+    """Times rtc's RustCrypto AES paths as built by a project that depends on rtc.
+
+    Cargo reads `.cargo/config.toml` from the directory it runs in and that directory's ancestors,
+    never from a dependency's, so an application does not get this repository's rustflags. Any
+    acceleration that depended on them would silently be missing there. Three builds of the same
+    consumer crate answer whether any does:
+
+    * consumer — run from outside the repository with no rustflags from any source: an empty
+      `CARGO_ENCODED_RUSTFLAGS` overrides the environment and every config file, including a
+      user-wide `~/.cargo/config.toml`, whose `target-cpu=native` could otherwise supply target
+      features an application's build would not have;
+    * repository — run from the repository root, so its `.cargo/config.toml` applies;
+    * software — the consumer build with `--cfg aes_backend="soft"`, forcing RustCrypto's
+      constant-time software AES: what a build without hardware AES looks like.
+    """
+    cache = Path(args.cache_dir)
+    outside = cache / "cwd"
+    outside.mkdir(parents=True, exist_ok=True)
+    if ROOT in outside.resolve().parents or outside.resolve() == ROOT:
+        raise SystemExit(f"--cache-dir must be outside {ROOT}: cargo would read its config")
+    # Pin shared dependencies to this tree's versions; the consumer is its own workspace.
+    if (ROOT / "Cargo.lock").exists():
+        shutil.copyfile(ROOT / "Cargo.lock", EXTERNAL_CONSUMER / "Cargo.lock")
+
+    clean = without_rustflags(dict(os.environ))
+    runs = {
+        "consumer": run_consumer(
+            "consumer build (outside the repository, no rustflags)",
+            outside,
+            {**clean, "CARGO_ENCODED_RUSTFLAGS": ""},
+            cache / "target-consumer",
+        ),
+        "repository": run_consumer(
+            "repository build (its .cargo/config.toml applies)",
+            ROOT,
+            clean,
+            cache / "target-repository",
+        ),
+        "software": run_consumer(
+            "software AES reference",
+            outside,
+            {**clean, "RUSTFLAGS": '--cfg aes_backend="soft"'},
+            cache / "target-software",
+        ),
+    }
+
+    cases = list(runs["consumer"]["times"])
+    print(f"\n{'case':<30} {'consumer':>10} {'repository':>11} {'software':>10}  consumer/repository")
+    slower = []
+    for case in cases:
+        consumer, repository, software = (runs[name]["times"].get(case, float("nan")) for name in runs)
+        ratio = consumer / repository
+        print(f"{case:<30} {consumer:>8.1f}ns {repository:>9.1f}ns {software:>8.1f}ns  {ratio:.2f}x")
+        # The control (AES-GCM on ring/aws-lc-rs) is unaffected by any AES cfg by design.
+        if "control" not in case and ratio > EXTERNAL_TOLERANCE:
+            slower.append(case)
+    if slower:
+        raise SystemExit(
+            f"\nA consumer build is more than {EXTERNAL_TOLERANCE}x slower than the repository "
+            f"build for: {', '.join(slower)}. Its AES backend likely depends on the repository's "
+            "rustflags, which applications do not inherit."
+        )
+    print(
+        f"\nConsumer builds get the repository build's AES backend (within {EXTERNAL_TOLERANCE}x "
+        "on every RustCrypto path). No consumer-side configuration is required."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -1341,6 +1471,18 @@ def main() -> None:
     )
     report.add_argument("--threshold", type=float, default=3.0, metavar="PERCENT")
 
+    external = commands.add_parser(
+        "external",
+        help="build benchmarks/external-consumer as an application would (outside this "
+        "repository) and check its AES paths match the in-repository build",
+    )
+    external.add_argument(
+        "--cache-dir",
+        default=str(DEFAULT_WORKTREE_DIR.parent / "external-consumer"),
+        help="outside the repository: where the consumer is built and run from "
+        f"(default: {DEFAULT_WORKTREE_DIR.parent / 'external-consumer'})",
+    )
+
     args = parser.parse_args()
     if getattr(args, "rounds", 1) < 1:
         parser.error("--rounds must be at least 1")
@@ -1351,6 +1493,7 @@ def main() -> None:
         "compare": command_compare,
         "upstream": command_upstream,
         "report": command_report,
+        "external": command_external,
     }[args.command](args)
 
 
