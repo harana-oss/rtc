@@ -11,8 +11,10 @@ probes. They are not an end-to-end performance profile, and no throughput or
 latency improvement has yet been measured. All issues are open.
 
 **Status (2026-09-21):** all 15 issues were validated. 13 are fixed; issues 3 and 6 are partly
-fixed, as described in their Resolution sections. Before/after measurements are in each issue
-and in [Results](#results) at the end.
+fixed, as described in their Resolution sections. Allocation and retained-heap measurements
+are in each issue. Timings are still to come from `python3 scripts/bench.py upstream --rounds 3`,
+which compares this fork with upstream webrtc-rs/rtc; upstream matches the pre-fix code everywhere
+except `rtc-sctp`.
 
 ## Priorities
 
