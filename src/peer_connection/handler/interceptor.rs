@@ -12,7 +12,6 @@ use crate::rtp_transceiver::rtp_sender::rtp_codec::{find_fec_payload_type, find_
 use crate::rtp_transceiver::rtp_sender::rtp_coding_parameters::{
     RTCRtpCodingParameters, RTCRtpRtxParameters,
 };
-use crate::rtp_transceiver::rtp_sender::rtp_header_extension_capability::RTCRtpHeaderExtensionCapability;
 use crate::rtp_transceiver::{
     PayloadType, RTCRtpReceiverId, SSRC, internal::RTCRtpTransceiverInternal,
 };
@@ -296,7 +295,7 @@ impl<'a> InterceptorHandler<'a> {
         // A publisher chooses the rrid string it puts on the wire. One naming a layer this
         // m= section never negotiated names nothing, so there is nowhere to record the pairing:
         // drop it rather than inventing a coding for it.
-        let Some(coding) = receiver.get_coding_parameter_mut_by_rid(rrid.as_str()) else {
+        let Some(coding) = receiver.get_coding_parameter_mut_by_rid(rrid) else {
             return false;
         };
 
@@ -315,7 +314,7 @@ impl<'a> InterceptorHandler<'a> {
         // together in `RTCPeerConnection::start_rtp`. `stop` unbinds from the track's, so a
         // pairing recorded on only the receiver's would leave the repair flow bound below having
         // never been unbound.
-        receiver.track_mut().set_rtx_ssrc_by_rid(&rrid, rtx_ssrc);
+        receiver.track_mut().set_rtx_ssrc_by_rid(rrid, rtx_ssrc);
         true
     }
 
@@ -452,11 +451,7 @@ impl<'a> InterceptorHandler<'a> {
             return false;
         };
 
-        // Get kind and mid before borrowing receiver mutably
-        let kind = transceiver.kind();
-        let mid = transceiver.mid().clone().unwrap_or_default();
-
-        let Some(receiver) = transceiver.receiver_mut() else {
+        let Some(receiver) = transceiver.receiver() else {
             return false;
         };
         if !receiver
@@ -488,6 +483,16 @@ impl<'a> InterceptorHandler<'a> {
         let Some((codec, payload_type)) = track_codec else {
             // Already established — the common case, once per packet after the first.
             return true;
+        };
+
+        // Setup-only metadata, read once the stream is known to need establishing: the mid is an
+        // owned copy, and taking it above the early return cost an allocation on every packet.
+        // Read before borrowing the receiver mutably.
+        let kind = transceiver.kind();
+        let mid = transceiver.mid().clone().unwrap_or_default();
+
+        let Some(receiver) = transceiver.receiver_mut() else {
+            return false;
         };
 
         // Get RTX and FEC SSRCs from coding parameters
@@ -713,7 +718,7 @@ impl<'a> InterceptorHandler<'a> {
         };
 
         // Validate rid against SDP. If invalid then drop it.
-        match receiver.get_coding_parameter_mut_by_rid(rid.as_str()) {
+        match receiver.get_coding_parameter_mut_by_rid(rid) {
             None => return false,
             Some(coding) if coding.ssrc == Some(ssrc) => return true,
             Some(coding) => coding.ssrc = Some(ssrc),
@@ -797,14 +802,14 @@ impl<'a> InterceptorHandler<'a> {
         let stream_id = receiver.track().stream_id().to_owned();
         let new_entry = receiver
             .track_mut()
-            .set_codec_ssrc_by_rid(codec.rtp_codec, ssrc, &rid);
+            .set_codec_ssrc_by_rid(codec.rtp_codec, ssrc, rid);
         assert!(!new_entry);
 
         // Create inbound stream accumulator before firing OnOpen event
         self.stats
-            .get_or_create_inbound_rtp_streams(ssrc, kind, &track_id, &mid, rtx_ssrc, fec_ssrc, id);
+            .get_or_create_inbound_rtp_streams(ssrc, kind, &track_id, mid, rtx_ssrc, fec_ssrc, id);
 
-        self.emit_on_open(now, id, track_id, stream_id, ssrc, Some(rid));
+        self.emit_on_open(now, id, track_id, stream_id, ssrc, Some(rid.to_owned()));
         true
     }
 
@@ -837,10 +842,17 @@ impl<'a> InterceptorHandler<'a> {
         });
     }
 
-    fn get_rtp_header_extension_ids(
+    /// The `mid`, `rid` and `repaired-rtp-stream-id` a packet carries, each empty when absent or
+    /// not valid UTF-8.
+    ///
+    /// Borrowed from the header rather than copied out of it. This runs for every packet that
+    /// carries any header extension — which, from a browser, is every packet — and until now it
+    /// allocated six strings a packet to answer it: three URIs to look the ids up with, and
+    /// three values that are only ever compared.
+    fn get_rtp_header_extension_ids<'h>(
         &self,
-        rtp_header: &rtp::Header,
-    ) -> Option<(String, String, String)> {
+        rtp_header: &'h rtp::Header,
+    ) -> Option<(&'h str, &'h str, &'h str)> {
         if !rtp_header.extension {
             return None;
         }
@@ -848,9 +860,7 @@ impl<'a> InterceptorHandler<'a> {
         // Get MID extension ID
         let (mid_extension_id, audio_supported, video_supported) = self
             .media_engine
-            .get_header_extension_id(RTCRtpHeaderExtensionCapability {
-                uri: ::sdp::extmap::SDES_MID_URI.to_owned(),
-            });
+            .negotiated_header_extension_id(::sdp::extmap::SDES_MID_URI);
         if !audio_supported && !video_supported {
             return None;
         }
@@ -858,39 +868,31 @@ impl<'a> InterceptorHandler<'a> {
         // Get RID extension ID
         let (rid_extension_id, audio_supported, video_supported) = self
             .media_engine
-            .get_header_extension_id(RTCRtpHeaderExtensionCapability {
-                uri: ::sdp::extmap::SDES_RTP_STREAM_ID_URI.to_owned(),
-            });
+            .negotiated_header_extension_id(::sdp::extmap::SDES_RTP_STREAM_ID_URI);
         if !audio_supported && !video_supported {
             return None;
         }
 
         // Get RRID extension ID
-        let (rrid_extension_id, _, _) =
-            self.media_engine
-                .get_header_extension_id(RTCRtpHeaderExtensionCapability {
-                    uri: ::sdp::extmap::SDES_REPAIR_RTP_STREAM_ID_URI.to_owned(),
-                });
+        let (rrid_extension_id, _, _) = self
+            .media_engine
+            .negotiated_header_extension_id(::sdp::extmap::SDES_REPAIR_RTP_STREAM_ID_URI);
 
-        let mid = if let Some(payload) = rtp_header.get_extension(mid_extension_id as u8) {
-            String::from_utf8(payload.to_vec()).unwrap_or_default()
-        } else {
-            String::new()
+        // `Header::get_extension`'s lookup, without the `Bytes` clone it returns.
+        let text = |id: u16| {
+            rtp_header
+                .extensions
+                .iter()
+                .find(|extension| extension.id == id as u8)
+                .map(|extension| std::str::from_utf8(&extension.payload).unwrap_or_default())
+                .unwrap_or_default()
         };
 
-        let rid = if let Some(payload) = rtp_header.get_extension(rid_extension_id as u8) {
-            String::from_utf8(payload.to_vec()).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let rrid = if let Some(payload) = rtp_header.get_extension(rrid_extension_id as u8) {
-            String::from_utf8(payload.to_vec()).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        Some((mid, rid, rrid))
+        Some((
+            text(mid_extension_id),
+            text(rid_extension_id),
+            text(rrid_extension_id),
+        ))
     }
 }
 

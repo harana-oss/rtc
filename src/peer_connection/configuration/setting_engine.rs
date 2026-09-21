@@ -364,6 +364,9 @@ pub struct SettingEngine {
     /// budget via rtc-sctp's `max_payload_size_for_mtu`. `None` uses the rtc-sctp
     /// default (`INITIAL_MTU`, 1191 — the TURN-relayed IPv6 minimum-MTU budget).
     pub(crate) sctp_mtu: Option<u32>,
+    /// Overrides how many undelivered inbound data-channel bytes the pipeline may hold before
+    /// SCTP stops draining. `None` uses the default (1 MiB).
+    pub(crate) sctp_read_backlog_bytes: Option<usize>,
     pub(crate) ignore_rid_pause_for_recv: bool,
     pub(crate) write_ssrc_attributes_for_simulcast: bool,
 }
@@ -1392,6 +1395,28 @@ impl SettingEngineBuilder {
     /// default, leave this unset.
     pub fn with_sctp_mtu(mut self, mtu: u32) -> Self {
         self.0.sctp_mtu = Some(mtu);
+        self
+    }
+
+    /// Overrides how many undelivered inbound data-channel payload bytes a connection may hold
+    /// before it stops reading from SCTP, in bytes. The default is 1 MiB.
+    ///
+    /// Inbound messages wait in the connection until the application reads them. Once the
+    /// application falls this far behind — or 256 messages behind, whichever comes first — the
+    /// connection leaves further data in SCTP's receive buffer, which shrinks the window
+    /// advertised to the peer and throttles it. Reading again resumes delivery. Media is never
+    /// held back by this.
+    ///
+    /// A message is admitted whenever the backlog is below this budget, however large the
+    /// message, so the backlog can exceed it by up to one maximum-size message
+    /// ([`SettingEngineBuilder::with_sctp_max_message_size`]); a budget smaller than a message
+    /// therefore slows delivery to one message at a time rather than stalling it. `0` is
+    /// treated as `1`.
+    ///
+    /// Lower it to cap per-connection memory when a server holds many connections whose
+    /// consumers may stall; raise it if an application reads in large, infrequent batches.
+    pub fn with_sctp_read_backlog_bytes(mut self, bytes: usize) -> Self {
+        self.0.sctp_read_backlog_bytes = Some(bytes);
         self
     }
 

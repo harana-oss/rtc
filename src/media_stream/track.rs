@@ -714,12 +714,12 @@ impl MediaStreamTrack {
         &mut self,
         codec: RTCRtpCodec,
         ssrc: SSRC,
-        rid: &RtpStreamId,
+        rid: &str,
     ) -> bool {
         if let Some(coding) = self
             .codings
             .iter_mut()
-            .find(|coding| &coding.rtp_coding_parameters.rid == rid)
+            .find(|coding| coding.rtp_coding_parameters.rid == rid)
         {
             coding.codec = codec;
             coding.rtp_coding_parameters.ssrc = Some(ssrc);
