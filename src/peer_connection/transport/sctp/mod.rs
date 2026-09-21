@@ -124,23 +124,23 @@ impl SctpTransport {
         self.negotiated_max_message_size
     }
 
-    /// This endpoint's own limit: its `canSendSize`, and the largest message it accepts.
+    /// This endpoint's own limit: its `canSendSize`, and the `max-message-size` it advertises and
+    /// accepts.
     ///
     /// Inbound messages are bounded by this, not by [`Self::max_message_size`]: that is the
     /// peer's limit, and the peer may send anything up to the `max-message-size` advertised here.
     pub(crate) fn local_max_message_size(&self) -> u32 {
-        // W3C §6.1.1.2 defines `canSendSize` as what this endpoint can actually send, and allows
-        // 0 only when the implementation "can handle messages of any size". This one cannot: each
-        // message is held in memory whole, so the ceiling is `MAX_MESSAGE_SIZE`. A configured 0
-        // therefore resolves to that ceiling rather than to "unlimited".
-        //
-        // Without this, `calc_message_size(0, 0)` yields `u32::MAX`, an unbounded message size.
-        // Reporting `u32::MAX` while enforcing something far smaller would be worse:
-        // `maxMessageSize` is a promise to the application about what it may pass to `send()`, so
-        // the value reported and the value enforced have to be the same one.
-        match self.max_message_size.as_usize() as u32 {
-            0 => SctpMaxMessageSize::MAX_MESSAGE_SIZE,
-            configured => configured,
+        // Capped at the SCTP receive buffer, which a message must fit in to be reassembled. W3C
+        // §6.1.1.2 allows `canSendSize` to be 0 only when the implementation "can handle messages
+        // of any size", so a configured 0 resolves to that cap rather than to "unlimited".
+        let max_receive_buffer_size = self
+            .max_receive_buffer_size
+            .unwrap_or_else(|| ::sctp::TransportConfig::default().max_receive_buffer_size());
+        match self.max_message_size {
+            SctpMaxMessageSize::Bounded(0) | SctpMaxMessageSize::Unbounded => {
+                max_receive_buffer_size
+            }
+            SctpMaxMessageSize::Bounded(size) => size.min(max_receive_buffer_size),
         }
     }
 
@@ -268,15 +268,40 @@ mod tests {
     }
 
     // Neither side names a limit. This implementation still has one, so `canSendSize` resolves to
-    // `MAX_MESSAGE_SIZE` rather than to "unlimited" (W3C §6.1.1.2 allows 0 only for an
+    // the SCTP receive buffer size rather than to "unlimited" (W3C §6.1.1.2 allows 0 only for an
     // implementation that can handle any size).
     #[test]
     fn no_limit_on_either_side_resolves_to_the_implementation_ceiling() {
         let transport = started_transport(SctpMaxMessageSize::Bounded(0), 0);
         assert_eq!(
-            Some(SctpMaxMessageSize::MAX_MESSAGE_SIZE),
+            Some(::sctp::TransportConfig::default().max_receive_buffer_size()),
             transport.max_message_size()
         );
+    }
+
+    #[test]
+    fn local_limit_is_capped_at_the_receive_buffer() {
+        let default_receive_buffer = ::sctp::TransportConfig::default().max_receive_buffer_size();
+        for (configured, receive_buffer, expected) in [
+            (SctpMaxMessageSize::Bounded(16384), Some(65536), 16384),
+            (SctpMaxMessageSize::Bounded(65536), Some(16384), 16384),
+            (SctpMaxMessageSize::Unbounded, Some(4 << 20), 4 << 20),
+            (SctpMaxMessageSize::Unbounded, None, default_receive_buffer),
+            (
+                SctpMaxMessageSize::Bounded(u32::MAX),
+                None,
+                default_receive_buffer,
+            ),
+        ] {
+            let transport = SctpTransport::new(
+                configured,
+                receive_buffer,
+                None,
+                test_transport_id(TransportKind::Sctp),
+                test_transport_id(TransportKind::Dtls),
+            );
+            assert_eq!(expected, transport.local_max_message_size());
+        }
     }
 
     #[test]

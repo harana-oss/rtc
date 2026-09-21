@@ -28,9 +28,6 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
-/// Over the 64 KiB assumed for the peer, within the 256 KiB this endpoint advertises.
-const MESSAGE_SIZE: usize = 128 * 1024;
-
 const NEGOTIATED_ID: u16 = 1;
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -42,20 +39,13 @@ struct Peer {
 }
 
 impl Peer {
-    async fn new(role: RTCDtlsRole) -> Result<Self> {
+    async fn new(role: RTCDtlsRole, setting_engine: SettingEngineBuilder) -> Result<Self> {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let addr = socket.local_addr()?;
 
         let mut pc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
-            .with_setting_engine(
-                SettingEngineBuilder::new()
-                    .with_answering_dtls_role(role)
-                    .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(
-                        SctpMaxMessageSize::MAX_MESSAGE_SIZE,
-                    ))
-                    .build(),
-            )
+            .with_setting_engine(setting_engine.with_answering_dtls_role(role).build())
             .build(Instant::now())?;
 
         let candidate = CandidateHostConfig {
@@ -125,11 +115,14 @@ async fn pump(a: &mut Peer, b: &mut Peer) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn message_within_the_advertised_limit_is_delivered() -> Result<()> {
-    let mut offer = Peer::new(RTCDtlsRole::Server).await?;
-    let mut answer = Peer::new(RTCDtlsRole::Client).await?;
-
+/// Connects the peers, sends one `size`-byte message from the answerer and returns the length
+/// of what the offerer receives. `rewrite_answer` edits the answer SDP the offerer applies.
+async fn send_to_offerer(
+    offer: &mut Peer,
+    answer: &mut Peer,
+    rewrite_answer: impl FnOnce(&str) -> String,
+    size: usize,
+) -> Result<Option<usize>> {
     let init = RTCDataChannelInit {
         ordered: true,
         negotiated: Some(NEGOTIATED_ID),
@@ -150,15 +143,7 @@ async fn message_within_the_advertised_limit_is_delivered() -> Result<()> {
     answer
         .pc
         .set_local_description(Instant::now(), sdp.clone())?;
-
-    // The offerer sees an answerer that names no limit, so it must assume 64 KiB for sending.
-    let sdp = RTCSessionDescription::answer(
-        sdp.sdp
-            .lines()
-            .filter(|line| !line.starts_with("a=max-message-size"))
-            .map(|line| format!("{line}\r\n"))
-            .collect(),
-    )?;
+    let sdp = RTCSessionDescription::answer(rewrite_answer(&sdp.sdp))?;
     offer.pc.set_remote_description(Instant::now(), sdp)?;
 
     let mut connected = false;
@@ -168,7 +153,7 @@ async fn message_within_the_advertised_limit_is_delivered() -> Result<()> {
 
     let start = Instant::now();
     while start.elapsed() < TEST_TIMEOUT && received.is_none() {
-        pump(&mut offer, &mut answer).await?;
+        pump(offer, answer).await?;
 
         while let Some(event) = answer.pc.poll_event() {
             match event {
@@ -195,12 +180,42 @@ async fn message_within_the_advertised_limit_is_delivered() -> Result<()> {
 
         if connected && open && !sent {
             let mut dc = answer.pc.data_channel(answer_dc).expect("channel is open");
-            dc.send(Instant::now(), BytesMut::zeroed(MESSAGE_SIZE))?;
+            dc.send(Instant::now(), BytesMut::zeroed(size))?;
             sent = true;
         }
     }
 
     assert!(sent, "peers never opened the channel");
+    Ok(received)
+}
+
+#[tokio::test]
+async fn message_within_the_advertised_limit_is_delivered() -> Result<()> {
+    // Over the 64 KiB assumed for the answerer, within the 256 KiB the offerer advertises.
+    const MESSAGE_SIZE: usize = 128 * 1024;
+
+    let settings = || {
+        SettingEngineBuilder::new()
+            .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(256 * 1024))
+    };
+    let mut offer = Peer::new(RTCDtlsRole::Server, settings()).await?;
+    let mut answer = Peer::new(RTCDtlsRole::Client, settings()).await?;
+
+    // The offerer sees an answerer that names no limit, so it must assume 64 KiB for sending.
+    let strip_max_message_size = |sdp: &str| {
+        sdp.lines()
+            .filter(|line| !line.starts_with("a=max-message-size"))
+            .map(|line| format!("{line}\r\n"))
+            .collect()
+    };
+    let received = send_to_offerer(
+        &mut offer,
+        &mut answer,
+        strip_max_message_size,
+        MESSAGE_SIZE,
+    )
+    .await?;
+
     assert_eq!(
         offer.pc.sctp().and_then(|sctp| sctp.max_message_size()),
         Some(64 * 1024),
@@ -211,6 +226,38 @@ async fn message_within_the_advertised_limit_is_delivered() -> Result<()> {
         Some(MESSAGE_SIZE),
         "a message within the advertised max-message-size must be delivered"
     );
+
+    offer.pc.close()?;
+    answer.pc.close()?;
+    Ok(())
+}
+
+/// `Unbounded` is the SCTP receive buffer size, and a message that large is delivered.
+#[tokio::test]
+async fn unbounded_limit_is_the_receive_buffer_size() -> Result<()> {
+    const RECEIVE_BUFFER: u32 = 2 * 1024 * 1024;
+
+    let settings = || {
+        SettingEngineBuilder::new()
+            .with_sctp_max_message_size(SctpMaxMessageSize::Unbounded)
+            .with_sctp_max_receive_buffer_size(RECEIVE_BUFFER)
+    };
+    let mut offer = Peer::new(RTCDtlsRole::Server, settings()).await?;
+    let mut answer = Peer::new(RTCDtlsRole::Client, settings()).await?;
+
+    let received = send_to_offerer(
+        &mut offer,
+        &mut answer,
+        str::to_owned,
+        RECEIVE_BUFFER as usize,
+    )
+    .await?;
+
+    assert_eq!(
+        offer.pc.sctp().and_then(|sctp| sctp.max_message_size()),
+        Some(RECEIVE_BUFFER)
+    );
+    assert_eq!(received, Some(RECEIVE_BUFFER as usize));
 
     offer.pc.close()?;
     answer.pc.close()?;
